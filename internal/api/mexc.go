@@ -31,12 +31,14 @@ type Ticker struct {
 }
 
 type Kline struct {
-	Timestamp int64   `json:"timestamp"`
-	Open      float64 `json:"open"`
-	High      float64 `json:"high"`
-	Low       float64 `json:"low"`
-	Close     float64 `json:"close"`
-	Volume    float64 `json:"volume"`
+	Timestamp        int64   `json:"timestamp"`
+	Open             float64 `json:"open"`
+	High             float64 `json:"high"`
+	Low              float64 `json:"low"`
+	Close            float64 `json:"close"`
+	Volume           float64 `json:"volume"`
+	CloseTime        int64   `json:"close_time"`
+	QuoteAssetVolume float64 `json:"quote_asset_volume"`
 }
 
 type MEXCClient struct {
@@ -144,14 +146,18 @@ func (c *MEXCClient) GetKline(symbol string, startTime, endTime int64) ([]Kline,
 			low, _ := strconv.ParseFloat(data[3].(string), 64)
 			closePrice, _ := strconv.ParseFloat(data[4].(string), 64)
 			volume, _ := strconv.ParseFloat(data[5].(string), 64)
+			closeTime, _ := data[6].(float64)
+			quoteAssetVolume, _ := strconv.ParseFloat(data[7].(string), 64)
 
 			klines = append(klines, Kline{
-				Timestamp: int64(timestamp) / 1000, // Convert from milliseconds to seconds
-				Open:      open,
-				High:      high,
-				Low:       low,
-				Close:     closePrice,
-				Volume:    volume,
+				Timestamp:        int64(timestamp) / 1000, // Convert from milliseconds to seconds
+				Open:             open,
+				High:             high,
+				Low:              low,
+				Close:            closePrice,
+				Volume:           volume,
+				CloseTime:        int64(closeTime) / 1000,
+				QuoteAssetVolume: quoteAssetVolume,
 			})
 		}
 

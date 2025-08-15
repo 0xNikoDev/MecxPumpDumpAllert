@@ -57,7 +57,7 @@ func main() {
 
 	volumeUSD, err := strconv.ParseFloat(volumeUSDStr, 64)
 	if err != nil || volumeUSD <= 0 {
-		volumeUSD = 5000 // default value
+		volumeUSD = 50000 // default value
 		log.Printf("⚠️  Используется значение по умолчанию для VOLUME_USD: $%.0f", volumeUSD)
 	}
 
