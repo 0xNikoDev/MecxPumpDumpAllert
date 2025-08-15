@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  mexc-alert:
+    build: .
+    container_name: mexc-pump-dump-alert
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TELEGRAM_ALLOWED_USER_ID=${TELEGRAM_ALLOWED_USER_ID}
+      - INTERVAL_SECONDS=${INTERVAL_SECONDS:-60}
+      - PRICE_CHANGE_PCT=${PRICE_CHANGE_PCT:-10.0}
+      - VOLUME_USD=${VOLUME_USD:-50000}
+    volumes:
+      - ./logs:/app/logs:rw
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
