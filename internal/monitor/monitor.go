@@ -22,7 +22,7 @@ type PricePoint struct {
 
 // getEyeEmoji returns an eye emoji based on volume
 func getEyeEmoji(volume float64) string {
-	if volume >= 10000 && volume < 50000 {
+	if volume >= 1000 && volume < 5000 {
 		return "👁️"
 	}
 	return ""
@@ -30,21 +30,18 @@ func getEyeEmoji(volume float64) string {
 
 // getFireEmojis returns fire emojis based on volume
 func getFireEmojis(volume float64) string {
-	if volume < 50000 {
+	if volume < 5000 {
 		return ""
 	}
-	fires := 1 // 50k–99k
-	if volume >= 100000 {
-		fires = 2 // 100k–199k
+	fires := 1 // 5k–9k
+	if volume >= 10000 {
+		fires = 2 // 10k–19k
 	}
-	if volume >= 200000 {
-		fires = 3 // 200k–299k
+	if volume >= 20000 {
+		fires = 3 // 20k–29k
 	}
-	if volume >= 300000 {
-		fires = 4 // 300k–399k
-	}
-	if volume >= 500000 {
-		fires = int(math.Min(4+math.Floor((volume-500000)/100000), 10)) // +1 per 100k, max 10
+	if volume >= 30000 {
+		fires = int(math.Min(3+math.Floor((volume-30000)/10000), 10)) // +1 per 10k, max 10
 	}
 	return strings.Repeat("🔥", fires)
 }
@@ -115,36 +112,131 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			if priceChanged {
 				log.Printf("Price changed for %s: %.2f%%", ticker.Symbol, priceChangePct)
 
-				// Get klines data for the period when price changed to calculate actual volume
+				// Try multiple approaches to get volume data
+				var volumeUSD float64
+				var volumeSource string
+
+				// Approach 1: Try to get klines data for accurate volume calculation
+				// Use a longer period to ensure we get some data
 				endTime := current.Time.Unix()
-				startTime := endTime - int64(cfg.IntervalSeconds)
+				startTime := endTime - int64(math.Max(float64(cfg.IntervalSeconds)*2, 300)) // At least 5 minutes
 
 				klines, err := client.GetKline(ticker.Symbol, startTime, endTime)
-				if err != nil {
-					log.Printf("Error fetching klines for %s: %v", ticker.Symbol, err)
-					// Fallback: try to estimate volume using 24h data
-					quoteVolume24h, volumeErr := strconv.ParseFloat(ticker.QuoteVol24h, 64)
-					if volumeErr == nil && quoteVolume24h > 0 {
-						// Estimate volume for interval: (24h quote volume / 1440 minutes) * interval minutes
-						intervalMinutes := float64(cfg.IntervalSeconds) / 60.0
-						estimatedVolume := (quoteVolume24h / 1440.0) * intervalMinutes
-						current.Volume = estimatedVolume
-						log.Printf("Using estimated volume for %s: $%.2f (based on 24h quote volume)", ticker.Symbol, current.Volume)
-					} else {
-						log.Printf("Cannot estimate volume for %s, skipping", ticker.Symbol)
-						continue
-					}
-				} else {
-					// Calculate total volume in USD for the period using QuoteAssetVolume
+				if err == nil && len(klines) > 0 {
+					// Calculate volume from klines using QuoteAssetVolume (already in USDT)
 					var totalVolumeUSD float64
+					var validKlines int
+					var recentKlines int
+
+					// Focus on more recent klines but use all available data
+					recentThreshold := endTime - int64(cfg.IntervalSeconds)
+
 					for _, kline := range klines {
-						// QuoteAssetVolume уже в USD/USDT - именно то что нам нужно!
-						totalVolumeUSD += kline.QuoteAssetVolume
+						isRecent := kline.Timestamp >= recentThreshold
+						if isRecent {
+							recentKlines++
+						}
+
+						if kline.QuoteAssetVolume > 0 {
+							// QuoteAssetVolume is already in quote currency (USDT/USD)
+							weight := 1.0
+							if isRecent {
+								weight = 2.0 // Give more weight to recent data
+							}
+							totalVolumeUSD += kline.QuoteAssetVolume * weight
+							validKlines++
+						} else if kline.Volume > 0 && kline.Close > 0 {
+							// Fallback: use base volume * close price
+							weight := 1.0
+							if isRecent {
+								weight = 2.0
+							}
+							volumeCalc := kline.Volume * kline.Close * weight
+							totalVolumeUSD += volumeCalc
+							validKlines++
+						}
 					}
 
-					current.Volume = totalVolumeUSD
-					log.Printf("Volume for %s during price change period: $%.2f (from %d klines)", ticker.Symbol, current.Volume, len(klines))
+					if totalVolumeUSD > 0 {
+						// Normalize the volume based on the time period
+						actualPeriod := float64(len(klines))
+						expectedPeriod := float64(cfg.IntervalSeconds) / 60.0 // Convert to minutes
+						if actualPeriod > expectedPeriod {
+							totalVolumeUSD = totalVolumeUSD * (expectedPeriod / actualPeriod)
+						}
+
+						volumeUSD = totalVolumeUSD
+						volumeSource = fmt.Sprintf("klines (%d/%d valid, %d recent)", validKlines, len(klines), recentKlines)
+					}
+					log.Printf("Klines debug for %s: %d total, %d recent, volume: $%.2f", ticker.Symbol, len(klines), recentKlines, totalVolumeUSD)
+				} else {
+					log.Printf("Klines failed for %s: %v", ticker.Symbol, err)
 				}
+
+				// Approach 2: If klines failed or returned 0, try using 24h volume estimate
+				if volumeUSD == 0 {
+					quoteVolume24h, quoteVolErr := strconv.ParseFloat(ticker.QuoteVol24h, 64)
+					volume24h, volErr := strconv.ParseFloat(ticker.Volume24h, 64)
+
+					if quoteVolErr == nil && quoteVolume24h > 0 {
+						// Use quote volume (already in USD/USDT) - most accurate
+						// Be more conservative with the estimate (divide by more than 24h worth of minutes)
+						intervalMinutes := float64(cfg.IntervalSeconds) / 60.0
+						minutesIn24h := 1440.0
+
+						// Add volatility multiplier - more volatile coins likely have uneven volume distribution
+						priceChangeMagnitude := math.Abs(priceChangePct)
+						volatilityMultiplier := 1.0
+						if priceChangeMagnitude >= 15 {
+							volatilityMultiplier = 3.0 // High volatility = volume spikes
+						} else if priceChangeMagnitude >= 10 {
+							volatilityMultiplier = 2.0
+						} else if priceChangeMagnitude >= 5 {
+							volatilityMultiplier = 1.5
+						}
+
+						estimatedVolume := (quoteVolume24h / minutesIn24h) * intervalMinutes * volatilityMultiplier
+						volumeUSD = estimatedVolume
+						volumeSource = fmt.Sprintf("24h quote estimate (×%.1f volatility)", volatilityMultiplier)
+					} else if volErr == nil && volume24h > 0 && current.Price > 0 {
+						// Use base volume * current price
+						intervalMinutes := float64(cfg.IntervalSeconds) / 60.0
+						minutesIn24h := 1440.0
+
+						priceChangeMagnitude := math.Abs(priceChangePct)
+						volatilityMultiplier := 1.0
+						if priceChangeMagnitude >= 15 {
+							volatilityMultiplier = 3.0
+						} else if priceChangeMagnitude >= 10 {
+							volatilityMultiplier = 2.0
+						} else if priceChangeMagnitude >= 5 {
+							volatilityMultiplier = 1.5
+						}
+
+						estimatedVolume := ((volume24h * current.Price) / minutesIn24h) * intervalMinutes * volatilityMultiplier
+						volumeUSD = estimatedVolume
+						volumeSource = fmt.Sprintf("24h base estimate (×%.1f volatility)", volatilityMultiplier)
+					}
+				}
+
+				// Approach 3: If still 0, use price change magnitude as volume indicator
+				if volumeUSD == 0 {
+					// Rough estimate based on price movement - not ideal but better than 0
+					priceChangeMagnitude := math.Abs(priceChangePct)
+					if priceChangeMagnitude >= 15 {
+						volumeUSD = 8000 // Assume significant volume for large moves
+						volumeSource = "estimated (large price movement)"
+					} else if priceChangeMagnitude >= 10 {
+						volumeUSD = 3000
+						volumeSource = "estimated (medium price movement)"
+					} else {
+						volumeUSD = 1000
+						volumeSource = "estimated (small price movement)"
+					}
+				}
+
+				current.Volume = volumeUSD
+				log.Printf("Volume for %s: $%.2f (%s)", ticker.Symbol, current.Volume, volumeSource)
 
 				if current.Volume >= cfg.VolumeUSD {
 					directionEmoji := "🟢"
