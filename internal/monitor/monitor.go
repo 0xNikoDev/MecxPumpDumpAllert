@@ -13,11 +13,19 @@ import (
 	"time"
 )
 
-// PriceData хранит только нужные данные для каждой монеты
-type PriceData struct {
-	Symbol    string
+// Константа частоты запросов к API (в секундах)
+const API_REQUEST_INTERVAL = 3
+
+// PricePoint хранит цену и время
+type PricePoint struct {
 	Price     float64
 	Timestamp time.Time
+}
+
+// PriceHistory хранит историю цен для одной монеты
+type PriceHistory struct {
+	Symbol string
+	Points []PricePoint
 }
 
 // getEyeEmoji returns an eye emoji based on volume
@@ -53,7 +61,7 @@ func getCircleEmojis(priceChangePct float64) string {
 	return strings.Repeat("🔵", circles)
 }
 
-// calculateVolumeUSD упрощенный расчет объема
+// calculateVolumeUSD упрощенный расчет объема за интервал
 func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
 	// Используем QuoteVolume24h (уже в USD/USDT) - самый точный показатель
 	quoteVolume24h, err := strconv.ParseFloat(ticker.QuoteVol24h, 64)
@@ -68,13 +76,12 @@ func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds
 		// Получаем процент изменения за 24 часа для корректировки
 		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
 
-		// Корректируем на волатильность - если есть большие движения,
-		// объем вероятно распределен неравномерно
+		// Корректируем на волатильность
 		volatilityMultiplier := 1.0
 		if changePctErr == nil {
 			absChangePct := math.Abs(changePct24h)
 			if absChangePct >= 20 {
-				volatilityMultiplier = 4.0 // Очень высокая волатильность
+				volatilityMultiplier = 4.0
 			} else if absChangePct >= 15 {
 				volatilityMultiplier = 3.0
 			} else if absChangePct >= 10 {
@@ -114,28 +121,76 @@ func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds
 		return baseVolume * volatilityMultiplier
 	}
 
-	// Если ничего не работает, возвращаем 0
 	return 0
 }
 
+// addPricePoint добавляет новую точку цены и очищает старые
+func (ph *PriceHistory) addPricePoint(price float64, timestamp time.Time, keepDuration time.Duration) {
+	// Добавляем новую точку
+	ph.Points = append(ph.Points, PricePoint{
+		Price:     price,
+		Timestamp: timestamp,
+	})
+
+	// Очищаем старые точки (оставляем данные за keepDuration + небольшой буфер)
+	cutoffTime := timestamp.Add(-keepDuration - 10*time.Second)
+	var newPoints []PricePoint
+	for _, point := range ph.Points {
+		if point.Timestamp.After(cutoffTime) {
+			newPoints = append(newPoints, point)
+		}
+	}
+	ph.Points = newPoints
+}
+
+// findPriceExtremes находит мин/макс цены в определенном временном диапазоне
+func (ph *PriceHistory) findPriceExtremes(fromTime, toTime time.Time) (minPrice, maxPrice float64, found bool) {
+	var prices []float64
+
+	for _, point := range ph.Points {
+		if point.Timestamp.After(fromTime) && point.Timestamp.Before(toTime) {
+			prices = append(prices, point.Price)
+		}
+	}
+
+	if len(prices) == 0 {
+		return 0, 0, false
+	}
+
+	minPrice = prices[0]
+	maxPrice = prices[0]
+
+	for _, price := range prices {
+		if price < minPrice {
+			minPrice = price
+		}
+		if price > maxPrice {
+			maxPrice = price
+		}
+	}
+
+	return minPrice, maxPrice, true
+}
+
 func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bot *telegram.Bot) {
-	// Храним только базовые цены для сравнения (timestamp интервал назад -> цена)
-	priceBaseline := make(map[string]PriceData)
+	// Храним историю цен для каждой монеты
+	priceHistories := make(map[string]*PriceHistory)
 
 	for {
 		startTime := time.Now()
-		log.Printf("Starting ticker fetch cycle at %s", startTime.Format("15:04:05"))
+		log.Printf("🔄 Starting ticker fetch cycle at %s", startTime.Format("15:04:05"))
 
 		tickers, err := client.GetTickers()
 		if err != nil {
-			log.Printf("Error fetching tickers: %v", err)
+			log.Printf("❌ Error fetching tickers: %v", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		log.Printf("Fetched %d tickers", len(tickers))
+		log.Printf("📊 Fetched %d tickers", len(tickers))
 
 		processedCount := 0
 		alertCount := 0
+		intervalDuration := time.Duration(cfg.IntervalSeconds) * time.Second
 
 		for _, ticker := range tickers {
 			if bl.IsBlacklisted(ticker.Symbol) {
@@ -143,108 +198,120 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			}
 
 			currentPrice, err := strconv.ParseFloat(ticker.Price, 64)
-			if err != nil {
-				log.Printf("Error parsing price for %s: %v", ticker.Symbol, err)
-				continue
-			}
-
-			if currentPrice <= 0 {
+			if err != nil || currentPrice <= 0 {
 				continue
 			}
 
 			processedCount++
 			currentTime := time.Now()
 
-			// Проверяем, есть ли базовая цена для сравнения
-			baseline, exists := priceBaseline[ticker.Symbol]
+			// Получаем или создаем историю для этой монеты
+			history, exists := priceHistories[ticker.Symbol]
 			if !exists {
-				// Первый раз видим эту монету - запоминаем текущую цену как базовую
-				priceBaseline[ticker.Symbol] = PriceData{
-					Symbol:    ticker.Symbol,
-					Price:     currentPrice,
-					Timestamp: currentTime,
-				}
+				history = &PriceHistory{Symbol: ticker.Symbol}
+				priceHistories[ticker.Symbol] = history
+			}
+
+			// Добавляем текущую цену в историю
+			history.addPricePoint(currentPrice, currentTime, intervalDuration)
+
+			// Проверяем, есть ли достаточно данных для анализа
+			if len(history.Points) < 2 {
 				continue
 			}
 
-			// Проверяем, прошел ли нужный интервал
-			timeDiff := currentTime.Sub(baseline.Timestamp).Seconds()
-			if timeDiff < float64(cfg.IntervalSeconds) {
-				continue // Еще рано проверять эту монету
+			// Определяем временной диапазон для сравнения
+			// Ищем цены от (intervalSeconds - 3) до (intervalSeconds + 3) секунд назад
+			compareFromTime := currentTime.Add(-intervalDuration - 3*time.Second)
+			compareToTime := currentTime.Add(-intervalDuration + 3*time.Second)
+
+			// Находим минимальную и максимальную цены в этом диапазоне
+			minPrice, maxPrice, found := history.findPriceExtremes(compareFromTime, compareToTime)
+			if !found {
+				continue
 			}
 
-			// Рассчитываем изменение цены
-			priceChangePct := ((currentPrice - baseline.Price) / baseline.Price) * 100
+			// Рассчитываем изменения для пампа (от минимума) и дампа (от максимума)
+			pumpChangePct := ((currentPrice - minPrice) / minPrice) * 100 // Рост от минимума
+			dumpChangePct := ((currentPrice - maxPrice) / maxPrice) * 100 // Падение от максимума
 
-			log.Printf("Price check for %s: %.8f -> %.8f (%.2f%% in %.0fs)",
-				ticker.Symbol, baseline.Price, currentPrice, priceChangePct, timeDiff)
+			// Определяем, какое изменение более значительное
+			var significantChangePct float64
+			var changeType string
+			var referencePrice float64
+
+			if math.Abs(pumpChangePct) > math.Abs(dumpChangePct) {
+				significantChangePct = pumpChangePct
+				changeType = "PUMP"
+				referencePrice = minPrice
+			} else {
+				significantChangePct = dumpChangePct
+				changeType = "DUMP"
+				referencePrice = maxPrice
+			}
+
+			log.Printf("📈 %s: %.8f->%.8f (%.2f%% %s from %.8f)",
+				ticker.Symbol, referencePrice, currentPrice, significantChangePct, changeType, referencePrice)
 
 			// Проверяем, превышает ли изменение пороговое значение
-			if math.Abs(priceChangePct) >= cfg.PriceChangePct {
+			if math.Abs(significantChangePct) >= cfg.PriceChangePct {
 				// Рассчитываем объем
 				volumeUSD := calculateVolumeUSD(ticker, currentPrice, cfg.IntervalSeconds)
 
-				log.Printf("Significant price change for %s: %.2f%%, volume: $%.2f",
-					ticker.Symbol, priceChangePct, volumeUSD)
+				log.Printf("🚨 Significant %s for %s: %.2f%%, volume: $%.2f",
+					changeType, ticker.Symbol, significantChangePct, volumeUSD)
 
 				// Проверяем объем
 				if volumeUSD >= cfg.VolumeUSD {
 					directionEmoji := "🟢"
-					if priceChangePct < 0 {
+					if significantChangePct < 0 {
 						directionEmoji = "🔴"
 					}
 
-					circleEmojis := getCircleEmojis(priceChangePct)
+					circleEmojis := getCircleEmojis(significantChangePct)
 					eyeEmoji := getEyeEmoji(volumeUSD)
 					fireEmojis := getFireEmojis(volumeUSD)
 
 					msg := fmt.Sprintf(
 						"%s %s\n%.2f%% %s\n$%.0f %s%s",
 						strings.ToUpper(ticker.Symbol), directionEmoji,
-						math.Abs(priceChangePct), circleEmojis,
+						math.Abs(significantChangePct), circleEmojis,
 						volumeUSD, eyeEmoji, fireEmojis,
 					)
 
-					log.Printf("🚨 ALERT: %s", msg)
+					log.Printf("🚨 ALERT SENT: %s", msg)
 					bot.SendMessage(msg)
 					bl.Add(ticker.Symbol, 10*time.Minute)
 					alertCount++
 				} else {
-					log.Printf("Volume too low for %s: $%.2f < $%.2f",
+					log.Printf("💰 Volume too low for %s: $%.2f < $%.2f",
 						ticker.Symbol, volumeUSD, cfg.VolumeUSD)
 				}
 			}
-
-			// Обновляем базовую цену для следующего сравнения
-			priceBaseline[ticker.Symbol] = PriceData{
-				Symbol:    ticker.Symbol,
-				Price:     currentPrice,
-				Timestamp: currentTime,
-			}
 		}
 
-		// Очистка старых данных (старше 2 интервалов)
-		cleanupThreshold := time.Now().Add(-time.Duration(cfg.IntervalSeconds*2) * time.Second)
+		// Очистка старых историй (для монет, которых больше нет в списке)
 		cleanedCount := 0
-		for symbol, data := range priceBaseline {
-			if data.Timestamp.Before(cleanupThreshold) {
-				delete(priceBaseline, symbol)
+		cleanupThreshold := time.Now().Add(-2 * intervalDuration)
+		for symbol, history := range priceHistories {
+			if len(history.Points) == 0 || history.Points[len(history.Points)-1].Timestamp.Before(cleanupThreshold) {
+				delete(priceHistories, symbol)
 				cleanedCount++
 			}
 		}
 
 		elapsed := time.Since(startTime)
-		log.Printf("Cycle complete: processed %d tickers, %d alerts, cleaned %d old entries in %v",
+		log.Printf("✅ Cycle complete: processed %d, alerts %d, cleaned %d histories in %v",
 			processedCount, alertCount, cleanedCount, elapsed)
 
-		// Ждем до следующего цикла
-		intervalDuration := time.Duration(cfg.IntervalSeconds) * time.Second
-		if elapsed < intervalDuration {
-			sleepDuration := intervalDuration - elapsed
-			log.Printf("Sleeping for %v until next cycle", sleepDuration)
+		// Ждем следующего запроса (константа API_REQUEST_INTERVAL)
+		requestInterval := time.Duration(API_REQUEST_INTERVAL) * time.Second
+		if elapsed < requestInterval {
+			sleepDuration := requestInterval - elapsed
+			log.Printf("😴 Sleeping for %v until next API request", sleepDuration)
 			time.Sleep(sleepDuration)
 		} else {
-			log.Printf("⚠️ Warning: Cycle took longer than interval (%v > %v)", elapsed, intervalDuration)
+			log.Printf("⚠️ Warning: Cycle took longer than request interval (%v > %v)", elapsed, requestInterval)
 		}
 	}
 }
