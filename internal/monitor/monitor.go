@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-type PricePoint struct {
-	Symbol string
-	Price  float64
-	Volume float64
-	Time   time.Time
+// PriceData хранит только нужные данные для каждой монеты
+type PriceData struct {
+	Symbol    string
+	Price     float64
+	Timestamp time.Time
 }
 
 // getEyeEmoji returns an eye emoji based on volume
@@ -53,12 +53,78 @@ func getCircleEmojis(priceChangePct float64) string {
 	return strings.Repeat("🔵", circles)
 }
 
+// calculateVolumeUSD упрощенный расчет объема
+func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
+	// Используем QuoteVolume24h (уже в USD/USDT) - самый точный показатель
+	quoteVolume24h, err := strconv.ParseFloat(ticker.QuoteVol24h, 64)
+	if err == nil && quoteVolume24h > 0 {
+		// Простое пропорциональное распределение
+		intervalMinutes := float64(intervalSeconds) / 60.0
+		minutesIn24h := 1440.0
+
+		// Базовый объем за интервал
+		baseVolume := (quoteVolume24h / minutesIn24h) * intervalMinutes
+
+		// Получаем процент изменения за 24 часа для корректировки
+		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
+
+		// Корректируем на волатильность - если есть большие движения,
+		// объем вероятно распределен неравномерно
+		volatilityMultiplier := 1.0
+		if changePctErr == nil {
+			absChangePct := math.Abs(changePct24h)
+			if absChangePct >= 20 {
+				volatilityMultiplier = 4.0 // Очень высокая волатильность
+			} else if absChangePct >= 15 {
+				volatilityMultiplier = 3.0
+			} else if absChangePct >= 10 {
+				volatilityMultiplier = 2.0
+			} else if absChangePct >= 5 {
+				volatilityMultiplier = 1.5
+			}
+		}
+
+		return baseVolume * volatilityMultiplier
+	}
+
+	// Fallback: используем Volume24h * currentPrice
+	volume24h, err := strconv.ParseFloat(ticker.Volume24h, 64)
+	if err == nil && volume24h > 0 && currentPrice > 0 {
+		intervalMinutes := float64(intervalSeconds) / 60.0
+		minutesIn24h := 1440.0
+
+		baseVolume := ((volume24h * currentPrice) / minutesIn24h) * intervalMinutes
+
+		// Применяем волатильность
+		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
+		volatilityMultiplier := 1.0
+		if changePctErr == nil {
+			absChangePct := math.Abs(changePct24h)
+			if absChangePct >= 20 {
+				volatilityMultiplier = 4.0
+			} else if absChangePct >= 15 {
+				volatilityMultiplier = 3.0
+			} else if absChangePct >= 10 {
+				volatilityMultiplier = 2.0
+			} else if absChangePct >= 5 {
+				volatilityMultiplier = 1.5
+			}
+		}
+
+		return baseVolume * volatilityMultiplier
+	}
+
+	// Если ничего не работает, возвращаем 0
+	return 0
+}
+
 func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bot *telegram.Bot) {
-	priceHistory := make(map[string][]PricePoint)
+	// Храним только базовые цены для сравнения (timestamp интервал назад -> цена)
+	priceBaseline := make(map[string]PriceData)
 
 	for {
 		startTime := time.Now()
-		log.Printf("Starting ticker fetch cycle at %s", startTime)
+		log.Printf("Starting ticker fetch cycle at %s", startTime.Format("15:04:05"))
 
 		tickers, err := client.GetTickers()
 		if err != nil {
@@ -68,226 +134,117 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 		}
 		log.Printf("Fetched %d tickers", len(tickers))
 
+		processedCount := 0
+		alertCount := 0
+
 		for _, ticker := range tickers {
 			if bl.IsBlacklisted(ticker.Symbol) {
-				log.Printf("Ticker %s is blacklisted, skipping", ticker.Symbol)
 				continue
 			}
 
-			price, err := strconv.ParseFloat(ticker.Price, 64)
+			currentPrice, err := strconv.ParseFloat(ticker.Price, 64)
 			if err != nil {
 				log.Printf("Error parsing price for %s: %v", ticker.Symbol, err)
 				continue
 			}
 
-			current := PricePoint{
-				Symbol: ticker.Symbol,
-				Price:  price,
-				Time:   time.Now(),
-			}
-
-			history, exists := priceHistory[ticker.Symbol]
-			if !exists {
-				priceHistory[ticker.Symbol] = []PricePoint{current}
+			if currentPrice <= 0 {
 				continue
 			}
 
-			var priceChanged bool
-			var priceChangePct float64
-			for _, past := range history {
-				timeDiff := current.Time.Sub(past.Time).Seconds()
-				if timeDiff <= float64(cfg.IntervalSeconds) {
-					if past.Price == 0 {
-						log.Printf("Past price is zero for %s, skipping", ticker.Symbol)
-						continue
-					}
-					priceChangePct = ((current.Price - past.Price) / past.Price) * 100
-					if math.Abs(priceChangePct) >= cfg.PriceChangePct {
-						priceChanged = true
-						break
-					}
+			processedCount++
+			currentTime := time.Now()
+
+			// Проверяем, есть ли базовая цена для сравнения
+			baseline, exists := priceBaseline[ticker.Symbol]
+			if !exists {
+				// Первый раз видим эту монету - запоминаем текущую цену как базовую
+				priceBaseline[ticker.Symbol] = PriceData{
+					Symbol:    ticker.Symbol,
+					Price:     currentPrice,
+					Timestamp: currentTime,
 				}
+				continue
 			}
 
-			if priceChanged {
-				log.Printf("Price changed for %s: %.2f%%", ticker.Symbol, priceChangePct)
+			// Проверяем, прошел ли нужный интервал
+			timeDiff := currentTime.Sub(baseline.Timestamp).Seconds()
+			if timeDiff < float64(cfg.IntervalSeconds) {
+				continue // Еще рано проверять эту монету
+			}
 
-				// Try multiple approaches to get volume data
-				var volumeUSD float64
-				var volumeSource string
+			// Рассчитываем изменение цены
+			priceChangePct := ((currentPrice - baseline.Price) / baseline.Price) * 100
 
-				// Approach 1: Try to get klines data for accurate volume calculation
-				// Use a longer period to ensure we get some data
-				endTime := current.Time.Unix()
-				startTime := endTime - int64(math.Max(float64(cfg.IntervalSeconds)*2, 300)) // At least 5 minutes
+			log.Printf("Price check for %s: %.8f -> %.8f (%.2f%% in %.0fs)",
+				ticker.Symbol, baseline.Price, currentPrice, priceChangePct, timeDiff)
 
-				klines, err := client.GetKline(ticker.Symbol, startTime, endTime)
-				if err == nil && len(klines) > 0 {
-					// Calculate volume from klines using QuoteAssetVolume (already in USDT)
-					var totalVolumeUSD float64
-					var validKlines int
-					var recentKlines int
+			// Проверяем, превышает ли изменение пороговое значение
+			if math.Abs(priceChangePct) >= cfg.PriceChangePct {
+				// Рассчитываем объем
+				volumeUSD := calculateVolumeUSD(ticker, currentPrice, cfg.IntervalSeconds)
 
-					// Focus on more recent klines but use all available data
-					recentThreshold := endTime - int64(cfg.IntervalSeconds)
+				log.Printf("Significant price change for %s: %.2f%%, volume: $%.2f",
+					ticker.Symbol, priceChangePct, volumeUSD)
 
-					for _, kline := range klines {
-						isRecent := kline.Timestamp >= recentThreshold
-						if isRecent {
-							recentKlines++
-						}
-
-						if kline.QuoteAssetVolume > 0 {
-							// QuoteAssetVolume is already in quote currency (USDT/USD)
-							weight := 1.0
-							if isRecent {
-								weight = 2.0 // Give more weight to recent data
-							}
-							totalVolumeUSD += kline.QuoteAssetVolume * weight
-							validKlines++
-						} else if kline.Volume > 0 && kline.Close > 0 {
-							// Fallback: use base volume * close price
-							weight := 1.0
-							if isRecent {
-								weight = 2.0
-							}
-							volumeCalc := kline.Volume * kline.Close * weight
-							totalVolumeUSD += volumeCalc
-							validKlines++
-						}
-					}
-
-					if totalVolumeUSD > 0 {
-						// Normalize the volume based on the time period
-						actualPeriod := float64(len(klines))
-						expectedPeriod := float64(cfg.IntervalSeconds) / 60.0 // Convert to minutes
-						if actualPeriod > expectedPeriod {
-							totalVolumeUSD = totalVolumeUSD * (expectedPeriod / actualPeriod)
-						}
-
-						volumeUSD = totalVolumeUSD
-						volumeSource = fmt.Sprintf("klines (%d/%d valid, %d recent)", validKlines, len(klines), recentKlines)
-					}
-					log.Printf("Klines debug for %s: %d total, %d recent, volume: $%.2f", ticker.Symbol, len(klines), recentKlines, totalVolumeUSD)
-				} else {
-					log.Printf("Klines failed for %s: %v", ticker.Symbol, err)
-				}
-
-				// Approach 2: If klines failed or returned 0, try using 24h volume estimate
-				if volumeUSD == 0 {
-					quoteVolume24h, quoteVolErr := strconv.ParseFloat(ticker.QuoteVol24h, 64)
-					volume24h, volErr := strconv.ParseFloat(ticker.Volume24h, 64)
-
-					if quoteVolErr == nil && quoteVolume24h > 0 {
-						// Use quote volume (already in USD/USDT) - most accurate
-						// Be more conservative with the estimate (divide by more than 24h worth of minutes)
-						intervalMinutes := float64(cfg.IntervalSeconds) / 60.0
-						minutesIn24h := 1440.0
-
-						// Add volatility multiplier - more volatile coins likely have uneven volume distribution
-						priceChangeMagnitude := math.Abs(priceChangePct)
-						volatilityMultiplier := 1.0
-						if priceChangeMagnitude >= 15 {
-							volatilityMultiplier = 3.0 // High volatility = volume spikes
-						} else if priceChangeMagnitude >= 10 {
-							volatilityMultiplier = 2.0
-						} else if priceChangeMagnitude >= 5 {
-							volatilityMultiplier = 1.5
-						}
-
-						estimatedVolume := (quoteVolume24h / minutesIn24h) * intervalMinutes * volatilityMultiplier
-						volumeUSD = estimatedVolume
-						volumeSource = fmt.Sprintf("24h quote estimate (×%.1f volatility)", volatilityMultiplier)
-					} else if volErr == nil && volume24h > 0 && current.Price > 0 {
-						// Use base volume * current price
-						intervalMinutes := float64(cfg.IntervalSeconds) / 60.0
-						minutesIn24h := 1440.0
-
-						priceChangeMagnitude := math.Abs(priceChangePct)
-						volatilityMultiplier := 1.0
-						if priceChangeMagnitude >= 15 {
-							volatilityMultiplier = 3.0
-						} else if priceChangeMagnitude >= 10 {
-							volatilityMultiplier = 2.0
-						} else if priceChangeMagnitude >= 5 {
-							volatilityMultiplier = 1.5
-						}
-
-						estimatedVolume := ((volume24h * current.Price) / minutesIn24h) * intervalMinutes * volatilityMultiplier
-						volumeUSD = estimatedVolume
-						volumeSource = fmt.Sprintf("24h base estimate (×%.1f volatility)", volatilityMultiplier)
-					}
-				}
-
-				// Approach 3: If still 0, use price change magnitude as volume indicator
-				if volumeUSD == 0 {
-					// Rough estimate based on price movement - not ideal but better than 0
-					priceChangeMagnitude := math.Abs(priceChangePct)
-					if priceChangeMagnitude >= 15 {
-						volumeUSD = 8000 // Assume significant volume for large moves
-						volumeSource = "estimated (large price movement)"
-					} else if priceChangeMagnitude >= 10 {
-						volumeUSD = 3000
-						volumeSource = "estimated (medium price movement)"
-					} else {
-						volumeUSD = 1000
-						volumeSource = "estimated (small price movement)"
-					}
-				}
-
-				current.Volume = volumeUSD
-				log.Printf("Volume for %s: $%.2f (%s)", ticker.Symbol, current.Volume, volumeSource)
-
-				if current.Volume >= cfg.VolumeUSD {
+				// Проверяем объем
+				if volumeUSD >= cfg.VolumeUSD {
 					directionEmoji := "🟢"
 					if priceChangePct < 0 {
 						directionEmoji = "🔴"
 					}
+
 					circleEmojis := getCircleEmojis(priceChangePct)
-					eyeEmoji := getEyeEmoji(current.Volume)
-					fireEmojis := getFireEmojis(current.Volume)
+					eyeEmoji := getEyeEmoji(volumeUSD)
+					fireEmojis := getFireEmojis(volumeUSD)
+
 					msg := fmt.Sprintf(
-						"%s %s\n%.2f%% %s\n%d $ %s%s",
+						"%s %s\n%.2f%% %s\n$%.0f %s%s",
 						strings.ToUpper(ticker.Symbol), directionEmoji,
 						math.Abs(priceChangePct), circleEmojis,
-						int(current.Volume), eyeEmoji, fireEmojis,
+						volumeUSD, eyeEmoji, fireEmojis,
 					)
-					log.Printf("Sending alert for %s: %s", ticker.Symbol, msg)
+
+					log.Printf("🚨 ALERT: %s", msg)
 					bot.SendMessage(msg)
 					bl.Add(ticker.Symbol, 10*time.Minute)
+					alertCount++
+				} else {
+					log.Printf("Volume too low for %s: $%.2f < $%.2f",
+						ticker.Symbol, volumeUSD, cfg.VolumeUSD)
 				}
 			}
 
-			priceHistory[ticker.Symbol] = append(history, current)
-		}
-
-		// Clean up priceHistory
-		for symbol, points := range priceHistory {
-			var newPoints []PricePoint
-			for _, point := range points {
-				if time.Now().Sub(point.Time).Seconds() <= float64(cfg.IntervalSeconds) {
-					newPoints = append(newPoints, point)
-				}
-			}
-			if len(newPoints) == 0 {
-				delete(priceHistory, symbol)
-			} else {
-				priceHistory[symbol] = newPoints
+			// Обновляем базовую цену для следующего сравнения
+			priceBaseline[ticker.Symbol] = PriceData{
+				Symbol:    ticker.Symbol,
+				Price:     currentPrice,
+				Timestamp: currentTime,
 			}
 		}
 
-		totalPoints := 0
-		for _, points := range priceHistory {
-			totalPoints += len(points)
+		// Очистка старых данных (старше 2 интервалов)
+		cleanupThreshold := time.Now().Add(-time.Duration(cfg.IntervalSeconds*2) * time.Second)
+		cleanedCount := 0
+		for symbol, data := range priceBaseline {
+			if data.Timestamp.Before(cleanupThreshold) {
+				delete(priceBaseline, symbol)
+				cleanedCount++
+			}
 		}
-		log.Printf("Total price history points: %d", totalPoints)
 
 		elapsed := time.Since(startTime)
-		intervalDuration := time.Duration(int64(cfg.IntervalSeconds)) * time.Second
+		log.Printf("Cycle complete: processed %d tickers, %d alerts, cleaned %d old entries in %v",
+			processedCount, alertCount, cleanedCount, elapsed)
+
+		// Ждем до следующего цикла
+		intervalDuration := time.Duration(cfg.IntervalSeconds) * time.Second
 		if elapsed < intervalDuration {
-			time.Sleep(intervalDuration - elapsed)
+			sleepDuration := intervalDuration - elapsed
+			log.Printf("Sleeping for %v until next cycle", sleepDuration)
+			time.Sleep(sleepDuration)
 		} else {
-			log.Printf("Warning: Cycle took longer than interval (%v > %v)", elapsed, intervalDuration)
+			log.Printf("⚠️ Warning: Cycle took longer than interval (%v > %v)", elapsed, intervalDuration)
 		}
 	}
 }
