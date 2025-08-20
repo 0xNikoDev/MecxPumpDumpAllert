@@ -13,9 +13,6 @@ import (
 	"time"
 )
 
-// Константа частоты запросов к API (в секундах)
-const API_REQUEST_INTERVAL = 3
-
 // PricePoint хранит цену и время
 type PricePoint struct {
 	Price     float64
@@ -26,6 +23,19 @@ type PricePoint struct {
 type PriceHistory struct {
 	Symbol string
 	Points []PricePoint
+}
+
+// calculateRequestInterval вычисляет частоту запросов на основе интервала сравнения
+func calculateRequestInterval(compareIntervalSeconds int) int {
+	// Формула: max(1, min(3, интервал_сравнения / 20))
+	requestInterval := compareIntervalSeconds / 20
+	if requestInterval < 1 {
+		requestInterval = 1
+	}
+	if requestInterval > 3 {
+		requestInterval = 3
+	}
+	return requestInterval
 }
 
 // getEyeEmoji returns an eye emoji based on volume
@@ -61,22 +71,17 @@ func getCircleEmojis(priceChangePct float64) string {
 	return strings.Repeat("🔵", circles)
 }
 
-// calculateVolumeUSD упрощенный расчет объема за интервал
-func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
-	// Используем QuoteVolume24h (уже в USD/USDT) - самый точный показатель
+// calculateVolumeFrom24h рассчитывает объем на основе 24-часового объема
+func calculateVolumeFrom24h(ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
+	// Метод 1: Используем QuoteVolume24h (уже в USD/USDT)
 	quoteVolume24h, err := strconv.ParseFloat(ticker.QuoteVol24h, 64)
 	if err == nil && quoteVolume24h > 0 {
-		// Простое пропорциональное распределение
-		intervalMinutes := float64(intervalSeconds) / 60.0
-		minutesIn24h := 1440.0
+		// Пропорциональное распределение
+		intervalFraction := float64(intervalSeconds) / (24 * 60 * 60) // доля от 24 часов
+		baseVolume := quoteVolume24h * intervalFraction
 
-		// Базовый объем за интервал
-		baseVolume := (quoteVolume24h / minutesIn24h) * intervalMinutes
-
-		// Получаем процент изменения за 24 часа для корректировки
+		// Корректировка на волатильность
 		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
-
-		// Корректируем на волатильность
 		volatilityMultiplier := 1.0
 		if changePctErr == nil {
 			absChangePct := math.Abs(changePct24h)
@@ -97,10 +102,8 @@ func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds
 	// Fallback: используем Volume24h * currentPrice
 	volume24h, err := strconv.ParseFloat(ticker.Volume24h, 64)
 	if err == nil && volume24h > 0 && currentPrice > 0 {
-		intervalMinutes := float64(intervalSeconds) / 60.0
-		minutesIn24h := 1440.0
-
-		baseVolume := ((volume24h * currentPrice) / minutesIn24h) * intervalMinutes
+		intervalFraction := float64(intervalSeconds) / (24 * 60 * 60)
+		baseVolume := (volume24h * currentPrice) * intervalFraction
 
 		// Применяем волатильность
 		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
@@ -124,6 +127,66 @@ func calculateVolumeUSD(ticker api.Ticker, currentPrice float64, intervalSeconds
 	return 0
 }
 
+// calculateVolumeFromKlines рассчитывает объем из klines за точный интервал
+func calculateVolumeFromKlines(client *api.MEXCClient, symbol string, intervalSeconds int) float64 {
+	endTime := time.Now().Unix()
+	startTime := endTime - int64(intervalSeconds) - 60 // добавляем буфер в 60 сек
+
+	klines, err := client.GetKline(symbol, startTime, endTime)
+	if err != nil {
+		return 0
+	}
+
+	if len(klines) == 0 {
+		return 0
+	}
+
+	// Фильтруем klines за точный интервал
+	targetStartTime := endTime - int64(intervalSeconds)
+	var totalVolumeUSD float64
+	var validKlines int
+
+	for _, kline := range klines {
+		// Проверяем, что kline попадает в наш интервал
+		if kline.Timestamp >= targetStartTime && kline.Timestamp <= endTime {
+			// Используем QuoteAssetVolume (уже в USD/USDT)
+			if kline.QuoteAssetVolume > 0 {
+				totalVolumeUSD += kline.QuoteAssetVolume
+				validKlines++
+			} else if kline.Volume > 0 && kline.Close > 0 {
+				// Fallback: базовый объем * цена закрытия
+				totalVolumeUSD += kline.Volume * kline.Close
+				validKlines++
+			}
+		}
+	}
+
+	if validKlines > 0 {
+		log.Printf("🔍 Klines volume for %s: $%.2f from %d valid klines", symbol, totalVolumeUSD, validKlines)
+	}
+
+	return totalVolumeUSD
+}
+
+// calculateVolumeUSD рассчитывает объем двумя методами и возвращает максимальный
+func calculateVolumeUSD(client *api.MEXCClient, ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
+	// Метод 1: из 24-часового объема
+	volume24h := calculateVolumeFrom24h(ticker, currentPrice, intervalSeconds)
+
+	// Метод 2: из klines за точный интервал
+	volumeKlines := calculateVolumeFromKlines(client, ticker.Symbol, intervalSeconds)
+
+	// Возвращаем максимальный
+	finalVolume := math.Max(volume24h, volumeKlines)
+
+	if volume24h > 0 || volumeKlines > 0 {
+		log.Printf("📊 Volume comparison for %s: 24h-based=$%.2f, klines=$%.2f → using $%.2f",
+			ticker.Symbol, volume24h, volumeKlines, finalVolume)
+	}
+
+	return finalVolume
+}
+
 // addPricePoint добавляет новую точку цены и очищает старые
 func (ph *PriceHistory) addPricePoint(price float64, timestamp time.Time, keepDuration time.Duration) {
 	// Добавляем новую точку
@@ -132,7 +195,7 @@ func (ph *PriceHistory) addPricePoint(price float64, timestamp time.Time, keepDu
 		Timestamp: timestamp,
 	})
 
-	// Очищаем старые точки (оставляем данные за keepDuration + небольшой буфер)
+	// Очищаем старые точки (оставляем данные за keepDuration + буфер)
 	cutoffTime := timestamp.Add(-keepDuration - 10*time.Second)
 	var newPoints []PricePoint
 	for _, point := range ph.Points {
@@ -178,7 +241,11 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 
 	for {
 		startTime := time.Now()
-		log.Printf("🔄 Starting ticker fetch cycle at %s", startTime.Format("15:04:05"))
+
+		// Вычисляем динамическую частоту запросов
+		requestIntervalSeconds := calculateRequestInterval(cfg.IntervalSeconds)
+		log.Printf("🔄 Starting cycle (compare interval: %ds, request interval: %ds)",
+			cfg.IntervalSeconds, requestIntervalSeconds)
 
 		tickers, err := client.GetTickers()
 		if err != nil {
@@ -221,9 +288,10 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			}
 
 			// Определяем временной диапазон для сравнения
-			// Ищем цены от (intervalSeconds - 3) до (intervalSeconds + 3) секунд назад
-			compareFromTime := currentTime.Add(-intervalDuration - 3*time.Second)
-			compareToTime := currentTime.Add(-intervalDuration + 3*time.Second)
+			// Ищем цены от (intervalSeconds - буфер) до (intervalSeconds + буфер) секунд назад
+			bufferSeconds := int(math.Max(3, float64(cfg.IntervalSeconds)*0.1)) // 10% от интервала, минимум 3 сек
+			compareFromTime := currentTime.Add(-intervalDuration - time.Duration(bufferSeconds)*time.Second)
+			compareToTime := currentTime.Add(-intervalDuration + time.Duration(bufferSeconds)*time.Second)
 
 			// Находим минимальную и максимальную цены в этом диапазоне
 			minPrice, maxPrice, found := history.findPriceExtremes(compareFromTime, compareToTime)
@@ -254,8 +322,9 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			if math.Abs(significantChangePct) >= cfg.PriceChangePct {
 				log.Printf("🎯 POTENTIAL %s: %s %.8f->%.8f (%.2f%%)",
 					changeType, ticker.Symbol, referencePrice, currentPrice, significantChangePct)
-				// Рассчитываем объем
-				volumeUSD := calculateVolumeUSD(ticker, currentPrice, cfg.IntervalSeconds)
+
+				// Рассчитываем объем двумя методами
+				volumeUSD := calculateVolumeUSD(client, ticker, currentPrice, cfg.IntervalSeconds)
 
 				log.Printf("📊 Volume check: %s $%.2f (required: $%.2f)",
 					ticker.Symbol, volumeUSD, cfg.VolumeUSD)
@@ -289,7 +358,7 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			}
 		}
 
-		// Очистка старых историй (для монет, которых больше нет в списке)
+		// Очистка старых историй
 		cleanedCount := 0
 		cleanupThreshold := time.Now().Add(-2 * intervalDuration)
 		for symbol, history := range priceHistories {
@@ -306,17 +375,15 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			log.Printf("🚨 CYCLE SUMMARY: %d ALERTS sent from %d processed tickers in %v",
 				alertCount, processedCount, elapsed)
 		} else if processedCount > 0 && processedCount%100 == 0 {
-			// Периодически показываем, что система работает (каждые ~100 тикеров)
+			// Периодически показываем, что система работает
 			log.Printf("✅ System active: processed %d tickers, no alerts in %v",
 				processedCount, elapsed)
 		}
 
-		// Ждем следующего запроса (константа API_REQUEST_INTERVAL)
-		requestInterval := time.Duration(API_REQUEST_INTERVAL) * time.Second
+		// Ждем следующего запроса (динамический интервал)
+		requestInterval := time.Duration(requestIntervalSeconds) * time.Second
 		if elapsed < requestInterval {
-			sleepDuration := requestInterval - elapsed
-			// Не логируем каждый sleep, только если цикл занял слишком много времени
-			time.Sleep(sleepDuration)
+			time.Sleep(requestInterval - elapsed)
 		} else {
 			log.Printf("⚠️ Warning: Cycle took longer than request interval (%v > %v)", elapsed, requestInterval)
 		}
