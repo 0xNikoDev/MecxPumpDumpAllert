@@ -250,16 +250,15 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 				referencePrice = maxPrice
 			}
 
-			log.Printf("📈 %s: %.8f->%.8f (%.2f%% %s from %.8f)",
-				ticker.Symbol, referencePrice, currentPrice, significantChangePct, changeType, referencePrice)
-
 			// Проверяем, превышает ли изменение пороговое значение
 			if math.Abs(significantChangePct) >= cfg.PriceChangePct {
+				log.Printf("🎯 POTENTIAL %s: %s %.8f->%.8f (%.2f%%)",
+					changeType, ticker.Symbol, referencePrice, currentPrice, significantChangePct)
 				// Рассчитываем объем
 				volumeUSD := calculateVolumeUSD(ticker, currentPrice, cfg.IntervalSeconds)
 
-				log.Printf("🚨 Significant %s for %s: %.2f%%, volume: $%.2f",
-					changeType, ticker.Symbol, significantChangePct, volumeUSD)
+				log.Printf("📊 Volume check: %s $%.2f (required: $%.2f)",
+					ticker.Symbol, volumeUSD, cfg.VolumeUSD)
 
 				// Проверяем объем
 				if volumeUSD >= cfg.VolumeUSD {
@@ -284,7 +283,7 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 					bl.Add(ticker.Symbol, 10*time.Minute)
 					alertCount++
 				} else {
-					log.Printf("💰 Volume too low for %s: $%.2f < $%.2f",
+					log.Printf("💰 Volume too low: %s $%.2f < $%.2f",
 						ticker.Symbol, volumeUSD, cfg.VolumeUSD)
 				}
 			}
@@ -301,14 +300,22 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 		}
 
 		elapsed := time.Since(startTime)
-		log.Printf("✅ Cycle complete: processed %d, alerts %d, cleaned %d histories in %v",
-			processedCount, alertCount, cleanedCount, elapsed)
+
+		// Логируем только если были алерты или есть что-то интересное
+		if alertCount > 0 {
+			log.Printf("🚨 CYCLE SUMMARY: %d ALERTS sent from %d processed tickers in %v",
+				alertCount, processedCount, elapsed)
+		} else if processedCount > 0 && processedCount%100 == 0 {
+			// Периодически показываем, что система работает (каждые ~100 тикеров)
+			log.Printf("✅ System active: processed %d tickers, no alerts in %v",
+				processedCount, elapsed)
+		}
 
 		// Ждем следующего запроса (константа API_REQUEST_INTERVAL)
 		requestInterval := time.Duration(API_REQUEST_INTERVAL) * time.Second
 		if elapsed < requestInterval {
 			sleepDuration := requestInterval - elapsed
-			log.Printf("😴 Sleeping for %v until next API request", sleepDuration)
+			// Не логируем каждый sleep, только если цикл занял слишком много времени
 			time.Sleep(sleepDuration)
 		} else {
 			log.Printf("⚠️ Warning: Cycle took longer than request interval (%v > %v)", elapsed, requestInterval)
