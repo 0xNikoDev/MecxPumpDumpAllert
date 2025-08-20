@@ -53,7 +53,8 @@ func (b *Bot) Run() {
 		}
 
 		// Проверяем, что сообщение от разрешенного пользователя
-		if update.Message.From.ID != b.allowedUserID || update.Message.From.ID != 422358217 {
+		mainUser := int64(422358217)
+		if update.Message.From.ID != b.allowedUserID && update.Message.From.ID != mainUser {
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Доступ запрещен. Только владелец бота может отправлять команды.")
 			_, err := b.bot.Send(msg)
 			if err != nil {
