@@ -71,120 +71,63 @@ func getCircleEmojis(priceChangePct float64) string {
 	return strings.Repeat("🔵", circles)
 }
 
-// calculateVolumeFrom24h рассчитывает объем на основе 24-часового объема
-func calculateVolumeFrom24h(ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
-	// Метод 1: Используем QuoteVolume24h (уже в USD/USDT)
-	quoteVolume24h, err := strconv.ParseFloat(ticker.QuoteVol24h, 64)
-	if err == nil && quoteVolume24h > 0 {
-		// Пропорциональное распределение
-		intervalFraction := float64(intervalSeconds) / (24 * 60 * 60) // доля от 24 часов
-		baseVolume := quoteVolume24h * intervalFraction
-
-		// Корректировка на волатильность
-		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
-		volatilityMultiplier := 1.0
-		if changePctErr == nil {
-			absChangePct := math.Abs(changePct24h)
-			if absChangePct >= 20 {
-				volatilityMultiplier = 4.0
-			} else if absChangePct >= 15 {
-				volatilityMultiplier = 3.0
-			} else if absChangePct >= 10 {
-				volatilityMultiplier = 2.0
-			} else if absChangePct >= 5 {
-				volatilityMultiplier = 1.5
-			}
-		}
-
-		return baseVolume * volatilityMultiplier
-	}
-
-	// Fallback: используем Volume24h * currentPrice
-	volume24h, err := strconv.ParseFloat(ticker.Volume24h, 64)
-	if err == nil && volume24h > 0 && currentPrice > 0 {
-		intervalFraction := float64(intervalSeconds) / (24 * 60 * 60)
-		baseVolume := (volume24h * currentPrice) * intervalFraction
-
-		// Применяем волатильность
-		changePct24h, changePctErr := strconv.ParseFloat(ticker.ChangePct, 64)
-		volatilityMultiplier := 1.0
-		if changePctErr == nil {
-			absChangePct := math.Abs(changePct24h)
-			if absChangePct >= 20 {
-				volatilityMultiplier = 4.0
-			} else if absChangePct >= 15 {
-				volatilityMultiplier = 3.0
-			} else if absChangePct >= 10 {
-				volatilityMultiplier = 2.0
-			} else if absChangePct >= 5 {
-				volatilityMultiplier = 1.5
-			}
-		}
-
-		return baseVolume * volatilityMultiplier
-	}
-
-	return 0
-}
-
-// calculateVolumeFromKlines рассчитывает объем из klines за точный интервал
-func calculateVolumeFromKlines(client *api.MEXCClient, symbol string, intervalSeconds int) float64 {
-	endTime := time.Now().Unix()
-	startTime := endTime - int64(intervalSeconds) - 60 // добавляем буфер в 60 сек
-
-	klines, err := client.GetKline(symbol, startTime, endTime)
+// calculateVolumeFromTrades рассчитывает точный объем из trades за интервал
+func calculateVolumeFromTrades(client *api.MEXCClient, symbol string, intervalSeconds int) (float64, error) {
+	// Запрашиваем последние trades (максимум 1000)
+	trades, err := client.GetTrades(symbol, 1000)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("failed to get trades: %v", err)
 	}
 
-	if len(klines) == 0 {
-		return 0
+	if len(trades) == 0 {
+		return 0, fmt.Errorf("no trades data")
 	}
 
-	// Фильтруем klines за точный интервал
-	targetStartTime := endTime - int64(intervalSeconds)
+	// Определяем временные рамки для фильтрации
+	currentTimeMs := time.Now().UnixNano() / int64(time.Millisecond)
+	intervalMs := int64(intervalSeconds) * 1000
+	startTimeMs := currentTimeMs - intervalMs
+
 	var totalVolumeUSD float64
-	var validKlines int
+	var validTrades int
 
-	for _, kline := range klines {
-		// Проверяем, что kline попадает в наш интервал
-		if kline.Timestamp >= targetStartTime && kline.Timestamp <= endTime {
-			// Используем QuoteAssetVolume (уже в USD/USDT)
-			if kline.QuoteAssetVolume > 0 {
-				totalVolumeUSD += kline.QuoteAssetVolume
-				validKlines++
-			} else if kline.Volume > 0 && kline.Close > 0 {
-				// Fallback: базовый объем * цена закрытия
-				totalVolumeUSD += kline.Volume * kline.Close
-				validKlines++
+	// Фильтруем trades по времени и суммируем quoteQty
+	for _, trade := range trades {
+		if trade.Time >= startTimeMs && trade.Time <= currentTimeMs {
+			quoteQty, err := strconv.ParseFloat(trade.QuoteQty, 64)
+			if err == nil && quoteQty > 0 {
+				totalVolumeUSD += quoteQty
+				validTrades++
 			}
 		}
 	}
 
-	if validKlines > 0 {
-		log.Printf("🔍 Klines volume for %s: $%.2f from %d valid klines", symbol, totalVolumeUSD, validKlines)
+	if validTrades > 0 {
+		return totalVolumeUSD, nil
+	} else {
+		return 0, fmt.Errorf("no valid trades in interval")
 	}
 
-	return totalVolumeUSD
+	return totalVolumeUSD, nil
 }
 
-// calculateVolumeUSD рассчитывает объем двумя методами и возвращает максимальный
+// calculateVolumeUSD рассчитывает объем из trades с повторными попытками
 func calculateVolumeUSD(client *api.MEXCClient, ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
-	// Метод 1: из 24-часового объема
-	volume24h := calculateVolumeFrom24h(ticker, currentPrice, intervalSeconds)
+	// Попытки получить объем из trades
+	for attempt := 1; attempt <= 3; attempt++ {
+		volume, err := calculateVolumeFromTrades(client, ticker.Symbol, intervalSeconds)
+		if err == nil {
+			return volume
+		}
 
-	// Метод 2: из klines за точный интервал
-	volumeKlines := calculateVolumeFromKlines(client, ticker.Symbol, intervalSeconds)
-
-	// Возвращаем максимальный
-	finalVolume := math.Max(volume24h, volumeKlines)
-
-	if volume24h > 0 || volumeKlines > 0 {
-		log.Printf("📊 Volume comparison for %s: 24h-based=$%.2f, klines=$%.2f → using $%.2f",
-			ticker.Symbol, volume24h, volumeKlines, finalVolume)
+		// Не логируем каждую неудачную попытку, чтобы не спамить логи
+		if attempt < 3 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
-	return finalVolume
+	// Если все попытки неудачны, возвращаем 0 (будет отклонено по минимальному объему)
+	return 0
 }
 
 // addPricePoint добавляет новую точку цены и очищает старые
@@ -323,11 +266,15 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 				log.Printf("🎯 POTENTIAL %s: %s %.8f->%.8f (%.2f%%)",
 					changeType, ticker.Symbol, referencePrice, currentPrice, significantChangePct)
 
-				// Рассчитываем объем двумя методами
+				// Рассчитываем точный объем из trades
 				volumeUSD := calculateVolumeUSD(client, ticker, currentPrice, cfg.IntervalSeconds)
 
-				log.Printf("📊 Volume check: %s $%.2f (required: $%.2f)",
-					ticker.Symbol, volumeUSD, cfg.VolumeUSD)
+				if volumeUSD > 0 {
+					log.Printf("📊 Trades volume for %s: $%.2f (required: $%.2f)",
+						ticker.Symbol, volumeUSD, cfg.VolumeUSD)
+				} else {
+					log.Printf("📊 No volume data for %s (trades API failed)", ticker.Symbol)
+				}
 
 				// Проверяем объем
 				if volumeUSD >= cfg.VolumeUSD {

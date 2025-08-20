@@ -41,6 +41,17 @@ type Kline struct {
 	QuoteAssetVolume float64 `json:"quote_asset_volume"`
 }
 
+type Trade struct {
+	ID           interface{} `json:"id"`
+	Price        string      `json:"price"`
+	Qty          string      `json:"qty"`
+	QuoteQty     string      `json:"quoteQty"`
+	Time         int64       `json:"time"`
+	IsBuyerMaker bool        `json:"isBuyerMaker"`
+	IsBestMatch  bool        `json:"isBestMatch"`
+	TradeType    string      `json:"tradeType"`
+}
+
 type MEXCClient struct {
 	client *http.Client
 }
@@ -166,4 +177,45 @@ func (c *MEXCClient) GetKline(symbol string, startTime, endTime int64) ([]Kline,
 	}
 
 	return nil, fmt.Errorf("failed to fetch klines for %s after 3 attempts", symbol)
+}
+
+func (c *MEXCClient) GetTrades(symbol string, limit int) ([]Trade, error) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		time.Sleep(50 * time.Millisecond) // Короткая пауза для trades API
+
+		params := url.Values{}
+		params.Set("symbol", symbol)
+		params.Set("limit", fmt.Sprintf("%d", limit))
+
+		urlTrades := "https://api.mexc.com/api/v3/trades?" + params.Encode()
+		req, err := http.NewRequest("GET", urlTrades, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create trades request: %v", err)
+		}
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			log.Printf("Attempt %d: trades request failed: %v", attempt, err)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read trades response: %v", err)
+		}
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("trades API error: status %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		var trades []Trade
+		if err := json.Unmarshal(body, &trades); err != nil {
+			return nil, fmt.Errorf("unmarshal trades error: %v, body: %s", err, string(body))
+		}
+
+		return trades, nil
+	}
+
+	return nil, fmt.Errorf("failed to fetch trades for %s after 3 attempts", symbol)
 }
