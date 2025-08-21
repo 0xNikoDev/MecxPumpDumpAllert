@@ -71,7 +71,7 @@ func getCircleEmojis(priceChangePct float64) string {
 	return strings.Repeat("🔵", circles)
 }
 
-// calculateVolumeFromTrades рассчитывает точный объем из trades за интервал
+// calculateVolumeFromTrades рассчитывает максимальный объем из скользящих окон или общий объем для больших интервалов
 func calculateVolumeFromTrades(client *api.MEXCClient, symbol string, intervalSeconds int) (float64, error) {
 	// Запрашиваем последние trades (максимум 1000)
 	trades, err := client.GetTrades(symbol, 1000)
@@ -83,35 +83,87 @@ func calculateVolumeFromTrades(client *api.MEXCClient, symbol string, intervalSe
 		return 0, fmt.Errorf("no trades data")
 	}
 
-	// Определяем временные рамки для фильтрации
 	currentTimeMs := time.Now().UnixNano() / int64(time.Millisecond)
+
+	// Если интервал больше 2 минут, используем простую логику - весь интервал + буфер
+	if intervalSeconds > 120 {
+		return calculateTotalVolumeForLargeInterval(trades, currentTimeMs, intervalSeconds)
+	}
+
+	// Для интервалов <= 2 минуты используем скользящие окна за последние 2 минуты
+	return calculateMaxVolumeFromSlidingWindows(trades, currentTimeMs, intervalSeconds)
+}
+
+// calculateTotalVolumeForLargeInterval рассчитывает общий объем для больших интервалов
+func calculateTotalVolumeForLargeInterval(trades []api.Trade, currentTimeMs int64, intervalSeconds int) (float64, error) {
+	// Добавляем буфер 10 секунд на время запроса
+	bufferMs := int64(10 * 1000)
 	intervalMs := int64(intervalSeconds) * 1000
-	startTimeMs := currentTimeMs - intervalMs
+	startTimeMs := currentTimeMs - intervalMs - bufferMs
 
 	var totalVolumeUSD float64
-	var validTrades int
 
-	// Фильтруем trades по времени и суммируем quoteQty
 	for _, trade := range trades {
 		if trade.Time >= startTimeMs && trade.Time <= currentTimeMs {
 			quoteQty, err := strconv.ParseFloat(trade.QuoteQty, 64)
 			if err == nil && quoteQty > 0 {
 				totalVolumeUSD += quoteQty
-				validTrades++
 			}
 		}
-	}
-
-	if validTrades > 0 {
-		return totalVolumeUSD, nil
-	} else {
-		return 0, fmt.Errorf("no valid trades in interval")
 	}
 
 	return totalVolumeUSD, nil
 }
 
-// calculateVolumeUSD рассчитывает объем из trades с повторными попытками
+// calculateMaxVolumeFromSlidingWindows находит максимальный объем среди скользящих окон за 2 минуты
+func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int64, intervalSeconds int) (float64, error) {
+	// Получаем трейды за последние 2 минуты
+	twoMinutesMs := int64(120 * 1000)
+	startTimeMs := currentTimeMs - twoMinutesMs
+
+	// Создаем структуру для хранения объемов по секундам
+	secondVolumes := make(map[int64]float64)
+
+	// Группируем трейды по секундам
+	for _, trade := range trades {
+		if trade.Time >= startTimeMs && trade.Time <= currentTimeMs {
+			quoteQty, err := strconv.ParseFloat(trade.QuoteQty, 64)
+			if err == nil && quoteQty > 0 {
+				// Округляем время до секунд
+				secondTimestamp := trade.Time / 1000
+				secondVolumes[secondTimestamp] += quoteQty
+			}
+		}
+	}
+
+	// Создаем скользящие окна и находим максимальный объем
+	intervalSizeSeconds := int64(intervalSeconds)
+	maxVolume := float64(0)
+
+	// Проходим по каждой секунде в диапазоне последних 2 минут
+	for i := int64(0); i <= 120-intervalSizeSeconds; i++ {
+		windowStartSecond := (currentTimeMs / 1000) - 120 + i
+		windowEndSecond := windowStartSecond + intervalSizeSeconds
+
+		windowVolume := float64(0)
+
+		// Суммируем объемы в текущем окне
+		for second := windowStartSecond; second < windowEndSecond; second++ {
+			if volume, exists := secondVolumes[second]; exists {
+				windowVolume += volume
+			}
+			// Если нет трейдов в секунде, объем остается 0 (не добавляем ничего)
+		}
+
+		if windowVolume > maxVolume {
+			maxVolume = windowVolume
+		}
+	}
+
+	return maxVolume, nil
+}
+
+// calculateVolumeUSD рассчитывает максимальный объем из скользящих окон или общий объем для больших интервалов
 func calculateVolumeUSD(client *api.MEXCClient, ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
 	// Попытки получить объем из trades
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -270,8 +322,13 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 				volumeUSD := calculateVolumeUSD(client, ticker, currentPrice, cfg.IntervalSeconds)
 
 				if volumeUSD > 0 {
-					log.Printf("📊 Trades volume for %s: $%.2f (required: $%.2f)",
-						ticker.Symbol, volumeUSD, cfg.VolumeUSD)
+					if cfg.IntervalSeconds <= 120 {
+						log.Printf("📊 Max sliding window volume for %s: $%.2f (required: $%.2f, interval: %ds)",
+							ticker.Symbol, volumeUSD, cfg.VolumeUSD, cfg.IntervalSeconds)
+					} else {
+						log.Printf("📊 Total interval volume for %s: $%.2f (required: $%.2f, interval: %ds)",
+							ticker.Symbol, volumeUSD, cfg.VolumeUSD, cfg.IntervalSeconds)
+					}
 				} else {
 					log.Printf("📊 No volume data for %s (trades API failed)", ticker.Symbol)
 				}
