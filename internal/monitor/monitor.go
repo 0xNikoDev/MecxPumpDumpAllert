@@ -27,15 +27,15 @@ type PriceHistory struct {
 
 // calculateRequestInterval вычисляет частоту запросов на основе интервала сравнения
 func calculateRequestInterval(compareIntervalSeconds int) int {
-	// Формула: max(1, min(3, интервал_сравнения / 20))
-	requestInterval := compareIntervalSeconds / 20
-	if requestInterval < 1 {
-		requestInterval = 1
+	// Оптимизированная формула для более частых запросов
+	// Для интервалов до 60 секунд - запросы каждую секунду
+	// Для больших интервалов - каждые 2-3 секунды
+	if compareIntervalSeconds <= 60 {
+		return 1
+	} else if compareIntervalSeconds <= 120 {
+		return 2
 	}
-	if requestInterval > 3 {
-		requestInterval = 3
-	}
-	return requestInterval
+	return 3
 }
 
 // getEyeEmoji returns an eye emoji based on volume
