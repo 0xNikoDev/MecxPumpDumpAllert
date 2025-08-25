@@ -10,6 +10,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,19 +25,20 @@ type PricePoint struct {
 type PriceHistory struct {
 	Symbol string
 	Points []PricePoint
+	mu     sync.RWMutex
 }
 
 // calculateRequestInterval вычисляет частоту запросов на основе интервала сравнения
-func calculateRequestInterval(compareIntervalSeconds int) int {
-	// Оптимизированная формула для более частых запросов
-	// Для интервалов до 60 секунд - запросы каждую секунду
-	// Для больших интервалов - каждые 2-3 секунды
-	if compareIntervalSeconds <= 60 {
-		return 1
-	} else if compareIntervalSeconds <= 120 {
-		return 2
+func calculateRequestInterval(compareIntervalSeconds int) time.Duration {
+	// Оптимизация для 5-секундного интервала - делаем запросы каждые 500мс
+	if compareIntervalSeconds <= 10 {
+		return 500 * time.Millisecond // 2 запроса в секунду для интервалов до 10 секунд
+	} else if compareIntervalSeconds <= 30 {
+		return 1 * time.Second // Запрос каждую секунду для интервалов 10-30 секунд
+	} else if compareIntervalSeconds <= 60 {
+		return 1500 * time.Millisecond // Запрос каждые 1.5 секунды для интервалов 30-60 секунд
 	}
-	return 3
+	return 2 * time.Second // Запрос каждые 2 секунды для больших интервалов
 }
 
 // getEyeEmoji returns an eye emoji based on volume
@@ -96,8 +99,8 @@ func calculateVolumeFromTrades(client *api.MEXCClient, symbol string, intervalSe
 
 // calculateTotalVolumeForLargeInterval рассчитывает общий объем для больших интервалов
 func calculateTotalVolumeForLargeInterval(trades []api.Trade, currentTimeMs int64, intervalSeconds int) (float64, error) {
-	// Добавляем буфер 10 секунд на время запроса
-	bufferMs := int64(10 * 1000)
+	// Уменьшаем буфер до 3 секунд для более точных результатов
+	bufferMs := int64(3 * 1000)
 	intervalMs := int64(intervalSeconds) * 1000
 	startTimeMs := currentTimeMs - intervalMs - bufferMs
 
@@ -152,7 +155,6 @@ func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int6
 			if volume, exists := secondVolumes[second]; exists {
 				windowVolume += volume
 			}
-			// Если нет трейдов в секунде, объем остается 0 (не добавляем ничего)
 		}
 
 		if windowVolume > maxVolume {
@@ -163,27 +165,33 @@ func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int6
 	return maxVolume, nil
 }
 
-// calculateVolumeUSD рассчитывает максимальный объем из скользящих окон или общий объем для больших интервалов
+// calculateVolumeUSD рассчитывает объем с оптимизацией для коротких интервалов
 func calculateVolumeUSD(client *api.MEXCClient, ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
-	// Попытки получить объем из trades
-	for attempt := 1; attempt <= 3; attempt++ {
+	// Для очень коротких интервалов (5 секунд) делаем только 1 попытку чтобы не задерживать
+	maxAttempts := 1
+	if intervalSeconds > 30 {
+		maxAttempts = 2
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		volume, err := calculateVolumeFromTrades(client, ticker.Symbol, intervalSeconds)
 		if err == nil {
 			return volume
 		}
 
-		// Не логируем каждую неудачную попытку, чтобы не спамить логи
-		if attempt < 3 {
-			time.Sleep(100 * time.Millisecond)
+		if attempt < maxAttempts {
+			time.Sleep(30 * time.Millisecond) // Минимальная задержка
 		}
 	}
 
-	// Если все попытки неудачны, возвращаем 0 (будет отклонено по минимальному объему)
 	return 0
 }
 
-// addPricePoint добавляет новую точку цены и очищает старые
+// addPricePoint добавляет новую точку цены и очищает старые (thread-safe)
 func (ph *PriceHistory) addPricePoint(price float64, timestamp time.Time, keepDuration time.Duration) {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+
 	// Добавляем новую точку
 	ph.Points = append(ph.Points, PricePoint{
 		Price:     price,
@@ -201,8 +209,11 @@ func (ph *PriceHistory) addPricePoint(price float64, timestamp time.Time, keepDu
 	ph.Points = newPoints
 }
 
-// findPriceExtremes находит мин/макс цены в определенном временном диапазоне
+// findPriceExtremes находит мин/макс цены в определенном временном диапазоне (thread-safe)
 func (ph *PriceHistory) findPriceExtremes(fromTime, toTime time.Time) (minPrice, maxPrice float64, found bool) {
+	ph.mu.RLock()
+	defer ph.mu.RUnlock()
+
 	var prices []float64
 
 	for _, point := range ph.Points {
@@ -230,166 +241,232 @@ func (ph *PriceHistory) findPriceExtremes(fromTime, toTime time.Time) (minPrice,
 	return minPrice, maxPrice, true
 }
 
+// getPointsCount возвращает количество точек в истории (thread-safe)
+func (ph *PriceHistory) getPointsCount() int {
+	ph.mu.RLock()
+	defer ph.mu.RUnlock()
+	return len(ph.Points)
+}
+
+// processTicker обрабатывает один тикер
+func processTicker(
+	ticker api.Ticker,
+	cfg *config.Config,
+	bl *blacklist.Blacklist,
+	bot *telegram.Bot,
+	client *api.MEXCClient,
+	priceHistories map[string]*PriceHistory,
+	historyMutex *sync.RWMutex,
+	processedCount *int32,
+	alertCount *int32,
+	intervalDuration time.Duration,
+) {
+	currentPrice, err := strconv.ParseFloat(ticker.Price, 64)
+	if err != nil || currentPrice <= 0 {
+		return
+	}
+
+	atomic.AddInt32(processedCount, 1)
+	currentTime := time.Now()
+
+	// Получаем или создаем историю для этой монеты
+	historyMutex.RLock()
+	history, exists := priceHistories[ticker.Symbol]
+	historyMutex.RUnlock()
+
+	if !exists {
+		history = &PriceHistory{Symbol: ticker.Symbol}
+		historyMutex.Lock()
+		priceHistories[ticker.Symbol] = history
+		historyMutex.Unlock()
+	}
+
+	// Добавляем текущую цену в историю
+	history.addPricePoint(currentPrice, currentTime, intervalDuration)
+
+	// Проверяем, есть ли достаточно данных для анализа
+	if history.getPointsCount() < 2 {
+		return
+	}
+
+	// Для 5-секундного интервала используем минимальный буфер
+	bufferSeconds := 1
+	if cfg.IntervalSeconds > 10 {
+		bufferSeconds = int(math.Max(2, float64(cfg.IntervalSeconds)*0.1))
+	}
+
+	compareFromTime := currentTime.Add(-intervalDuration - time.Duration(bufferSeconds)*time.Second)
+	compareToTime := currentTime.Add(-intervalDuration + time.Duration(bufferSeconds)*time.Second)
+
+	// Находим минимальную и максимальную цены в этом диапазоне
+	minPrice, maxPrice, found := history.findPriceExtremes(compareFromTime, compareToTime)
+	if !found {
+		return
+	}
+
+	// Рассчитываем изменения для пампа и дампа
+	pumpChangePct := ((currentPrice - minPrice) / minPrice) * 100
+	dumpChangePct := ((currentPrice - maxPrice) / maxPrice) * 100
+
+	// Определяем, какое изменение более значительное
+	var significantChangePct float64
+	var referencePrice float64
+
+	if math.Abs(pumpChangePct) > math.Abs(dumpChangePct) {
+		significantChangePct = pumpChangePct
+		referencePrice = minPrice
+	} else {
+		significantChangePct = dumpChangePct
+		referencePrice = maxPrice
+	}
+
+	// Проверяем, превышает ли изменение пороговое значение
+	if math.Abs(significantChangePct) >= cfg.PriceChangePct {
+		// Рассчитываем точный объем из trades
+		volumeUSD := calculateVolumeUSD(client, ticker, currentPrice, cfg.IntervalSeconds)
+
+		// Проверяем объем
+		if volumeUSD >= cfg.VolumeUSD {
+			directionEmoji := "🟢"
+			if significantChangePct < 0 {
+				directionEmoji = "🔴"
+			}
+
+			circleEmojis := getCircleEmojis(significantChangePct)
+			eyeEmoji := getEyeEmoji(volumeUSD)
+			fireEmojis := getFireEmojis(volumeUSD)
+
+			msg := fmt.Sprintf(
+				"%s %s\n%.2f%% %s\n$%.0f %s%s",
+				strings.ToUpper(ticker.Symbol), directionEmoji,
+				math.Abs(significantChangePct), circleEmojis,
+				volumeUSD, eyeEmoji, fireEmojis,
+			)
+
+			log.Printf("🚨 ALERT: %s (%.8f->%.8f)", ticker.Symbol, referencePrice, currentPrice)
+			bot.SendMessage(msg)
+			bl.Add(ticker.Symbol, 10*time.Minute)
+			atomic.AddInt32(alertCount, 1)
+		}
+	}
+}
+
 func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bot *telegram.Bot) {
 	// Храним историю цен для каждой монеты
 	priceHistories := make(map[string]*PriceHistory)
+	historyMutex := &sync.RWMutex{}
+
+	// Канал для ограничения параллельных запросов к API
+	// Для 5-секундного интервала увеличиваем до 15 параллельных запросов
+	semaphore := make(chan struct{}, 15)
+
+	// Статистика для мониторинга производительности
+	var lastLogTime time.Time
+	var totalCycles int64
+
+	log.Printf("🚀 Monitor started (interval: %ds, threshold: %.2f%%, volume: $%.0f)",
+		cfg.IntervalSeconds, cfg.PriceChangePct, cfg.VolumeUSD)
 
 	for {
 		startTime := time.Now()
+		atomic.AddInt64(&totalCycles, 1)
 
 		// Вычисляем динамическую частоту запросов
-		requestIntervalSeconds := calculateRequestInterval(cfg.IntervalSeconds)
-		log.Printf("🔄 Starting cycle (compare interval: %ds, request interval: %ds)",
-			cfg.IntervalSeconds, requestIntervalSeconds)
+		requestInterval := calculateRequestInterval(cfg.IntervalSeconds)
 
 		tickers, err := client.GetTickers()
 		if err != nil {
 			log.Printf("❌ Error fetching tickers: %v", err)
-			time.Sleep(5 * time.Second)
+			time.Sleep(1 * time.Second)
 			continue
 		}
-		log.Printf("📊 Fetched %d tickers", len(tickers))
 
-		processedCount := 0
-		alertCount := 0
+		var processedCount int32
+		var alertCount int32
 		intervalDuration := time.Duration(cfg.IntervalSeconds) * time.Second
 
+		// Используем WaitGroup для параллельной обработки
+		var wg sync.WaitGroup
+
+		// Обрабатываем тикеры параллельно
 		for _, ticker := range tickers {
 			if bl.IsBlacklisted(ticker.Symbol) {
 				continue
 			}
 
-			currentPrice, err := strconv.ParseFloat(ticker.Price, 64)
-			if err != nil || currentPrice <= 0 {
-				continue
-			}
+			wg.Add(1)
+			go func(t api.Ticker) {
+				defer wg.Done()
 
-			processedCount++
-			currentTime := time.Now()
-
-			// Получаем или создаем историю для этой монеты
-			history, exists := priceHistories[ticker.Symbol]
-			if !exists {
-				history = &PriceHistory{Symbol: ticker.Symbol}
-				priceHistories[ticker.Symbol] = history
-			}
-
-			// Добавляем текущую цену в историю
-			history.addPricePoint(currentPrice, currentTime, intervalDuration)
-
-			// Проверяем, есть ли достаточно данных для анализа
-			if len(history.Points) < 2 {
-				continue
-			}
-
-			// Определяем временной диапазон для сравнения
-			// Ищем цены от (intervalSeconds - буфер) до (intervalSeconds + буфер) секунд назад
-			bufferSeconds := int(math.Max(3, float64(cfg.IntervalSeconds)*0.1)) // 10% от интервала, минимум 3 сек
-			compareFromTime := currentTime.Add(-intervalDuration - time.Duration(bufferSeconds)*time.Second)
-			compareToTime := currentTime.Add(-intervalDuration + time.Duration(bufferSeconds)*time.Second)
-
-			// Находим минимальную и максимальную цены в этом диапазоне
-			minPrice, maxPrice, found := history.findPriceExtremes(compareFromTime, compareToTime)
-			if !found {
-				continue
-			}
-
-			// Рассчитываем изменения для пампа (от минимума) и дампа (от максимума)
-			pumpChangePct := ((currentPrice - minPrice) / minPrice) * 100 // Рост от минимума
-			dumpChangePct := ((currentPrice - maxPrice) / maxPrice) * 100 // Падение от максимума
-
-			// Определяем, какое изменение более значительное
-			var significantChangePct float64
-			var changeType string
-			var referencePrice float64
-
-			if math.Abs(pumpChangePct) > math.Abs(dumpChangePct) {
-				significantChangePct = pumpChangePct
-				changeType = "PUMP"
-				referencePrice = minPrice
-			} else {
-				significantChangePct = dumpChangePct
-				changeType = "DUMP"
-				referencePrice = maxPrice
-			}
-
-			// Проверяем, превышает ли изменение пороговое значение
-			if math.Abs(significantChangePct) >= cfg.PriceChangePct {
-				log.Printf("🎯 POTENTIAL %s: %s %.8f->%.8f (%.2f%%)",
-					changeType, ticker.Symbol, referencePrice, currentPrice, significantChangePct)
-
-				// Рассчитываем точный объем из trades
-				volumeUSD := calculateVolumeUSD(client, ticker, currentPrice, cfg.IntervalSeconds)
-
-				if volumeUSD > 0 {
-					if cfg.IntervalSeconds <= 120 {
-						log.Printf("📊 Max sliding window volume for %s: $%.2f (required: $%.2f, interval: %ds)",
-							ticker.Symbol, volumeUSD, cfg.VolumeUSD, cfg.IntervalSeconds)
-					} else {
-						log.Printf("📊 Total interval volume for %s: $%.2f (required: $%.2f, interval: %ds)",
-							ticker.Symbol, volumeUSD, cfg.VolumeUSD, cfg.IntervalSeconds)
-					}
-				} else {
-					log.Printf("📊 No volume data for %s (trades API failed)", ticker.Symbol)
-				}
-
-				// Проверяем объем
-				if volumeUSD >= cfg.VolumeUSD {
-					directionEmoji := "🟢"
-					if significantChangePct < 0 {
-						directionEmoji = "🔴"
-					}
-
-					circleEmojis := getCircleEmojis(significantChangePct)
-					eyeEmoji := getEyeEmoji(volumeUSD)
-					fireEmojis := getFireEmojis(volumeUSD)
-
-					msg := fmt.Sprintf(
-						"%s %s\n%.2f%% %s\n$%.0f %s%s",
-						strings.ToUpper(ticker.Symbol), directionEmoji,
-						math.Abs(significantChangePct), circleEmojis,
-						volumeUSD, eyeEmoji, fireEmojis,
+				// Ограничиваем количество параллельных запросов
+				select {
+				case semaphore <- struct{}{}:
+					defer func() { <-semaphore }()
+					processTicker(
+						t, cfg, bl, bot, client,
+						priceHistories, historyMutex,
+						&processedCount, &alertCount,
+						intervalDuration,
 					)
-
-					log.Printf("🚨 ALERT SENT: %s", msg)
-					bot.SendMessage(msg)
-					bl.Add(ticker.Symbol, 10*time.Minute)
-					alertCount++
-				} else {
-					log.Printf("💰 Volume too low: %s $%.2f < $%.2f",
-						ticker.Symbol, volumeUSD, cfg.VolumeUSD)
+				case <-time.After(50 * time.Millisecond):
+					// Пропускаем если семафор занят слишком долго
+					return
 				}
-			}
+			}(ticker)
 		}
 
-		// Очистка старых историй
-		cleanedCount := 0
-		cleanupThreshold := time.Now().Add(-2 * intervalDuration)
-		for symbol, history := range priceHistories {
-			if len(history.Points) == 0 || history.Points[len(history.Points)-1].Timestamp.Before(cleanupThreshold) {
-				delete(priceHistories, symbol)
-				cleanedCount++
+		// Ждем завершения обработки всех тикеров с таймаутом
+		done := make(chan bool)
+		go func() {
+			wg.Wait()
+			done <- true
+		}()
+
+		select {
+		case <-done:
+			// Все обработано
+		case <-time.After(requestInterval - 100*time.Millisecond):
+			// Таймаут - переходим к следующему циклу
+		}
+
+		// Очистка старых историй (делаем реже - каждые 20 циклов)
+		if atomic.LoadInt64(&totalCycles)%20 == 0 {
+			historyMutex.Lock()
+			cleanupThreshold := time.Now().Add(-2 * intervalDuration)
+			for symbol, history := range priceHistories {
+				if history.getPointsCount() == 0 {
+					delete(priceHistories, symbol)
+					continue
+				}
+				history.mu.RLock()
+				lastPoint := len(history.Points) > 0 && history.Points[len(history.Points)-1].Timestamp.Before(cleanupThreshold)
+				history.mu.RUnlock()
+				if lastPoint {
+					delete(priceHistories, symbol)
+				}
 			}
+			historyMutex.Unlock()
 		}
 
 		elapsed := time.Since(startTime)
+		currentAlertCount := atomic.LoadInt32(&alertCount)
+		currentProcessedCount := atomic.LoadInt32(&processedCount)
 
-		// Логируем только если были алерты или есть что-то интересное
-		if alertCount > 0 {
-			log.Printf("🚨 CYCLE SUMMARY: %d ALERTS sent from %d processed tickers in %v",
-				alertCount, processedCount, elapsed)
-		} else if processedCount > 0 && processedCount%100 == 0 {
-			// Периодически показываем, что система работает
-			log.Printf("✅ System active: processed %d tickers, no alerts in %v",
-				processedCount, elapsed)
+		// Логируем статистику
+		if currentAlertCount > 0 {
+			log.Printf("🚨 Cycle #%d: %d alerts, %d tickers, %.2fs",
+				totalCycles, currentAlertCount, currentProcessedCount, elapsed.Seconds())
+			lastLogTime = time.Now()
+		} else if time.Since(lastLogTime) > 30*time.Second {
+			// Показываем статус каждые 30 секунд
+			log.Printf("✅ Cycle #%d: %d tickers, %.2fs",
+				totalCycles, currentProcessedCount, elapsed.Seconds())
+			lastLogTime = time.Now()
 		}
 
-		// Ждем следующего запроса (динамический интервал)
-		requestInterval := time.Duration(requestIntervalSeconds) * time.Second
+		// Ждем следующего запроса
 		if elapsed < requestInterval {
 			time.Sleep(requestInterval - elapsed)
-		} else {
-			log.Printf("⚠️ Warning: Cycle took longer than request interval (%v > %v)", elapsed, requestInterval)
 		}
 	}
 }
