@@ -1,13 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -53,169 +54,179 @@ type Trade struct {
 }
 
 type MEXCClient struct {
-	client *http.Client
+	client       *http.Client
+	tickersCache *TickersCache
+}
+
+type TickersCache struct {
+	data      []Ticker
+	timestamp time.Time
+	mu        sync.RWMutex
 }
 
 func NewMEXCClient() *MEXCClient {
+	// Оптимизированный HTTP клиент
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false, // Включаем keep-alive для переиспользования соединений
+	}
+
 	return &MEXCClient{
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Transport: transport,
+			Timeout:   5 * time.Second, // Уменьшаем таймаут до 5 секунд
 		},
+		tickersCache: &TickersCache{},
 	}
 }
 
+// GetTickers с кэшированием
 func (c *MEXCClient) GetTickers() ([]Ticker, error) {
-	for attempt := 1; attempt <= 3; attempt++ {
-		time.Sleep(100 * time.Millisecond)
+	// Проверяем кэш (данные актуальны 200мс)
+	c.tickersCache.mu.RLock()
+	if time.Since(c.tickersCache.timestamp) < 200*time.Millisecond && len(c.tickersCache.data) > 0 {
+		cached := c.tickersCache.data
+		c.tickersCache.mu.RUnlock()
+		return cached, nil
+	}
+	c.tickersCache.mu.RUnlock()
 
-		req, err := http.NewRequest("GET", "https://api.mexc.com/api/v3/ticker/24hr", nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %v", err)
-		}
+	// Делаем запрос с контекстом и таймаутом
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-		resp, err := c.client.Do(req)
-		if err != nil {
-			log.Printf("Attempt %d: request failed: %v", attempt, err)
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %v", err)
-		}
-
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(body))
-		}
-
-		var tickers []Ticker
-		if err := json.Unmarshal(body, &tickers); err != nil {
-			return nil, fmt.Errorf("unmarshal error: %v, body: %s", err, string(body))
-		}
-
-		log.Printf("GetTickers: %d tickers", len(tickers))
-		return tickers, nil
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.mexc.com/api/v3/ticker/24hr", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	return nil, fmt.Errorf("failed to fetch tickers after 3 attempts")
-}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
 
-func (c *MEXCClient) GetKline(symbol string, startTime, endTime int64) ([]Kline, error) {
-	for attempt := 1; attempt <= 3; attempt++ {
-		time.Sleep(100 * time.Millisecond)
-
-		params := url.Values{}
-		params.Set("symbol", symbol)
-		params.Set("interval", "1m") // 1 minute interval
-		if startTime != 0 {
-			params.Set("startTime", fmt.Sprintf("%d", startTime*1000)) // Convert to milliseconds
-		}
-		if endTime != 0 {
-			params.Set("endTime", fmt.Sprintf("%d", endTime*1000))
-		}
-		params.Set("limit", "1000")
-
-		urlKline := "https://api.mexc.com/api/v3/klines?" + params.Encode()
-		req, err := http.NewRequest("GET", urlKline, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create kline request: %v", err)
-		}
-
-		resp, err := c.client.Do(req)
-		if err != nil {
-			log.Printf("Attempt %d: kline request failed: %v", attempt, err)
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read kline response: %v", err)
-		}
-
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("kline API error: status %d, body: %s", resp.StatusCode, string(body))
-		}
-
-		// MEXC klines response format: [[timestamp, open, high, low, close, volume, close_time, quote_asset_volume], ...]
-		var klineData [][]interface{}
-		if err := json.Unmarshal(body, &klineData); err != nil {
-			return nil, fmt.Errorf("unmarshal kline error: %v, body: %s", err, string(body))
-		}
-
-		var klines []Kline
-		for _, data := range klineData {
-			if len(data) < 8 {
-				log.Printf("Warning: incomplete kline data for %s: %v", symbol, data)
-				continue
-			}
-
-			timestamp, _ := data[0].(float64)
-			open, _ := strconv.ParseFloat(data[1].(string), 64)
-			high, _ := strconv.ParseFloat(data[2].(string), 64)
-			low, _ := strconv.ParseFloat(data[3].(string), 64)
-			closePrice, _ := strconv.ParseFloat(data[4].(string), 64)
-			volume, _ := strconv.ParseFloat(data[5].(string), 64)
-			closeTime, _ := data[6].(float64)
-			quoteAssetVolume, _ := strconv.ParseFloat(data[7].(string), 64)
-
-			klines = append(klines, Kline{
-				Timestamp:        int64(timestamp) / 1000, // Convert from milliseconds to seconds
-				Open:             open,
-				High:             high,
-				Low:              low,
-				Close:            closePrice,
-				Volume:           volume,
-				CloseTime:        int64(closeTime) / 1000,
-				QuoteAssetVolume: quoteAssetVolume,
-			})
-		}
-
-		log.Printf("GetKline: %d klines for %s", len(klines), symbol)
-		return klines, nil
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	return nil, fmt.Errorf("failed to fetch klines for %s after 3 attempts", symbol)
+	var tickers []Ticker
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&tickers); err != nil {
+		return nil, fmt.Errorf("unmarshal error: %v", err)
+	}
+
+	// Обновляем кэш
+	c.tickersCache.mu.Lock()
+	c.tickersCache.data = tickers
+	c.tickersCache.timestamp = time.Now()
+	c.tickersCache.mu.Unlock()
+
+	return tickers, nil
 }
 
+// GetTrades оптимизированный для скорости
 func (c *MEXCClient) GetTrades(symbol string, limit int) ([]Trade, error) {
-	for attempt := 1; attempt <= 3; attempt++ {
-		time.Sleep(50 * time.Millisecond) // Короткая пауза для trades API
+	// Быстрый запрос без повторов
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-		params := url.Values{}
-		params.Set("symbol", symbol)
-		params.Set("limit", fmt.Sprintf("%d", limit))
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	params.Set("limit", fmt.Sprintf("%d", limit))
 
-		urlTrades := "https://api.mexc.com/api/v3/trades?" + params.Encode()
-		req, err := http.NewRequest("GET", urlTrades, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create trades request: %v", err)
-		}
+	urlTrades := "https://api.mexc.com/api/v3/trades?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, "GET", urlTrades, nil)
+	if err != nil {
+		return nil, err
+	}
 
-		resp, err := c.client.Do(req)
-		if err != nil {
-			log.Printf("Attempt %d: trades request failed: %v", attempt, err)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("trades API error: status %d", resp.StatusCode)
+	}
+
+	var trades []Trade
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&trades); err != nil {
+		return nil, err
+	}
+
+	return trades, nil
+}
+
+// GetKline с контекстом и таймаутом
+func (c *MEXCClient) GetKline(symbol string, startTime, endTime int64) ([]Kline, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	params.Set("interval", "1m")
+	if startTime != 0 {
+		params.Set("startTime", fmt.Sprintf("%d", startTime*1000))
+	}
+	if endTime != 0 {
+		params.Set("endTime", fmt.Sprintf("%d", endTime*1000))
+	}
+	params.Set("limit", "1000")
+
+	urlKline := "https://api.mexc.com/api/v3/klines?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, "GET", urlKline, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("kline API error: status %d", resp.StatusCode)
+	}
+
+	var klineData [][]interface{}
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&klineData); err != nil {
+		return nil, err
+	}
+
+	var klines []Kline
+	for _, data := range klineData {
+		if len(data) < 8 {
 			continue
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read trades response: %v", err)
-		}
+		timestamp, _ := data[0].(float64)
+		open, _ := strconv.ParseFloat(data[1].(string), 64)
+		high, _ := strconv.ParseFloat(data[2].(string), 64)
+		low, _ := strconv.ParseFloat(data[3].(string), 64)
+		closePrice, _ := strconv.ParseFloat(data[4].(string), 64)
+		volume, _ := strconv.ParseFloat(data[5].(string), 64)
+		closeTime, _ := data[6].(float64)
+		quoteAssetVolume, _ := strconv.ParseFloat(data[7].(string), 64)
 
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("trades API error: status %d, body: %s", resp.StatusCode, string(body))
-		}
-
-		var trades []Trade
-		if err := json.Unmarshal(body, &trades); err != nil {
-			return nil, fmt.Errorf("unmarshal trades error: %v, body: %s", err, string(body))
-		}
-
-		return trades, nil
+		klines = append(klines, Kline{
+			Timestamp:        int64(timestamp) / 1000,
+			Open:             open,
+			High:             high,
+			Low:              low,
+			Close:            closePrice,
+			Volume:           volume,
+			CloseTime:        int64(closeTime) / 1000,
+			QuoteAssetVolume: quoteAssetVolume,
+		})
 	}
 
-	return nil, fmt.Errorf("failed to fetch trades for %s after 3 attempts", symbol)
+	return klines, nil
 }

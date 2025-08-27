@@ -28,17 +28,60 @@ type PriceHistory struct {
 	mu     sync.RWMutex
 }
 
+// VolumeCache кэш для объемов
+type VolumeCache struct {
+	data map[string]*VolumeEntry
+	mu   sync.RWMutex
+}
+
+type VolumeEntry struct {
+	Volume    float64
+	Timestamp time.Time
+}
+
+func NewVolumeCache() *VolumeCache {
+	return &VolumeCache{
+		data: make(map[string]*VolumeEntry),
+	}
+}
+
+func (vc *VolumeCache) Get(symbol string, maxAge time.Duration) (float64, bool) {
+	vc.mu.RLock()
+	defer vc.mu.RUnlock()
+
+	entry, exists := vc.data[symbol]
+	if !exists {
+		return 0, false
+	}
+
+	if time.Since(entry.Timestamp) > maxAge {
+		return 0, false
+	}
+
+	return entry.Volume, true
+}
+
+func (vc *VolumeCache) Set(symbol string, volume float64) {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+
+	vc.data[symbol] = &VolumeEntry{
+		Volume:    volume,
+		Timestamp: time.Now(),
+	}
+}
+
 // calculateRequestInterval вычисляет частоту запросов на основе интервала сравнения
 func calculateRequestInterval(compareIntervalSeconds int) time.Duration {
-	// Оптимизация для 5-секундного интервала - делаем запросы каждые 500мс
-	if compareIntervalSeconds <= 10 {
-		return 500 * time.Millisecond // 2 запроса в секунду для интервалов до 10 секунд
+	// Для 5-секундного интервала - максимальная частота
+	if compareIntervalSeconds <= 5 {
+		return 250 * time.Millisecond // 4 запроса в секунду!
+	} else if compareIntervalSeconds <= 10 {
+		return 500 * time.Millisecond // 2 запроса в секунду
 	} else if compareIntervalSeconds <= 30 {
-		return 1 * time.Second // Запрос каждую секунду для интервалов 10-30 секунд
-	} else if compareIntervalSeconds <= 60 {
-		return 1500 * time.Millisecond // Запрос каждые 1.5 секунды для интервалов 30-60 секунд
+		return 1 * time.Second
 	}
-	return 2 * time.Second // Запрос каждые 2 секунды для больших интервалов
+	return 2 * time.Second
 }
 
 // getEyeEmoji returns an eye emoji based on volume
@@ -74,51 +117,43 @@ func getCircleEmojis(priceChangePct float64) string {
 	return strings.Repeat("🔵", circles)
 }
 
-// calculateVolumeFromTrades рассчитывает максимальный объем из скользящих окон или общий объем для больших интервалов
-func calculateVolumeFromTrades(client *api.MEXCClient, symbol string, intervalSeconds int) (float64, error) {
-	// Запрашиваем последние trades (максимум 1000)
+// calculateVolumeFromTradesFast быстрый расчет объема без повторных попыток
+func calculateVolumeFromTradesFast(client *api.MEXCClient, symbol string, intervalSeconds int) (float64, error) {
+	// Запрашиваем trades с таймаутом
 	trades, err := client.GetTrades(symbol, 1000)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get trades: %v", err)
+		return 0, err
 	}
 
 	if len(trades) == 0 {
-		return 0, fmt.Errorf("no trades data")
+		return 0, fmt.Errorf("no trades")
 	}
 
 	currentTimeMs := time.Now().UnixNano() / int64(time.Millisecond)
 
-	// Если интервал больше 2 минут, используем простую логику - весь интервал + буфер
-	if intervalSeconds > 120 {
-		return calculateTotalVolumeForLargeInterval(trades, currentTimeMs, intervalSeconds)
+	// Для коротких интервалов используем упрощенный расчет
+	if intervalSeconds <= 10 {
+		// Просто считаем объем за последние N секунд
+		intervalMs := int64(intervalSeconds) * 1000
+		startTimeMs := currentTimeMs - intervalMs
+
+		var totalVolumeUSD float64
+		for _, trade := range trades {
+			if trade.Time >= startTimeMs && trade.Time <= currentTimeMs {
+				quoteQty, err := strconv.ParseFloat(trade.QuoteQty, 64)
+				if err == nil && quoteQty > 0 {
+					totalVolumeUSD += quoteQty
+				}
+			}
+		}
+		return totalVolumeUSD, nil
 	}
 
-	// Для интервалов <= 2 минуты используем скользящие окна за последние 2 минуты
+	// Для больших интервалов используем скользящие окна
 	return calculateMaxVolumeFromSlidingWindows(trades, currentTimeMs, intervalSeconds)
 }
 
-// calculateTotalVolumeForLargeInterval рассчитывает общий объем для больших интервалов
-func calculateTotalVolumeForLargeInterval(trades []api.Trade, currentTimeMs int64, intervalSeconds int) (float64, error) {
-	// Уменьшаем буфер до 3 секунд для более точных результатов
-	bufferMs := int64(3 * 1000)
-	intervalMs := int64(intervalSeconds) * 1000
-	startTimeMs := currentTimeMs - intervalMs - bufferMs
-
-	var totalVolumeUSD float64
-
-	for _, trade := range trades {
-		if trade.Time >= startTimeMs && trade.Time <= currentTimeMs {
-			quoteQty, err := strconv.ParseFloat(trade.QuoteQty, 64)
-			if err == nil && quoteQty > 0 {
-				totalVolumeUSD += quoteQty
-			}
-		}
-	}
-
-	return totalVolumeUSD, nil
-}
-
-// calculateMaxVolumeFromSlidingWindows находит максимальный объем среди скользящих окон за 2 минуты
+// calculateMaxVolumeFromSlidingWindows находит максимальный объем среди скользящих окон
 func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int64, intervalSeconds int) (float64, error) {
 	// Получаем трейды за последние 2 минуты
 	twoMinutesMs := int64(120 * 1000)
@@ -132,14 +167,12 @@ func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int6
 		if trade.Time >= startTimeMs && trade.Time <= currentTimeMs {
 			quoteQty, err := strconv.ParseFloat(trade.QuoteQty, 64)
 			if err == nil && quoteQty > 0 {
-				// Округляем время до секунд
 				secondTimestamp := trade.Time / 1000
 				secondVolumes[secondTimestamp] += quoteQty
 			}
 		}
 	}
 
-	// Создаем скользящие окна и находим максимальный объем
 	intervalSizeSeconds := int64(intervalSeconds)
 	maxVolume := float64(0)
 
@@ -149,8 +182,6 @@ func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int6
 		windowEndSecond := windowStartSecond + intervalSizeSeconds
 
 		windowVolume := float64(0)
-
-		// Суммируем объемы в текущем окне
 		for second := windowStartSecond; second < windowEndSecond; second++ {
 			if volume, exists := secondVolumes[second]; exists {
 				windowVolume += volume
@@ -165,40 +196,17 @@ func calculateMaxVolumeFromSlidingWindows(trades []api.Trade, currentTimeMs int6
 	return maxVolume, nil
 }
 
-// calculateVolumeUSD рассчитывает объем с оптимизацией для коротких интервалов
-func calculateVolumeUSD(client *api.MEXCClient, ticker api.Ticker, currentPrice float64, intervalSeconds int) float64 {
-	// Для очень коротких интервалов (5 секунд) делаем только 1 попытку чтобы не задерживать
-	maxAttempts := 1
-	if intervalSeconds > 30 {
-		maxAttempts = 2
-	}
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		volume, err := calculateVolumeFromTrades(client, ticker.Symbol, intervalSeconds)
-		if err == nil {
-			return volume
-		}
-
-		if attempt < maxAttempts {
-			time.Sleep(30 * time.Millisecond) // Минимальная задержка
-		}
-	}
-
-	return 0
-}
-
 // addPricePoint добавляет новую точку цены и очищает старые (thread-safe)
 func (ph *PriceHistory) addPricePoint(price float64, timestamp time.Time, keepDuration time.Duration) {
 	ph.mu.Lock()
 	defer ph.mu.Unlock()
 
-	// Добавляем новую точку
 	ph.Points = append(ph.Points, PricePoint{
 		Price:     price,
 		Timestamp: timestamp,
 	})
 
-	// Очищаем старые точки (оставляем данные за keepDuration + буфер)
+	// Очищаем старые точки
 	cutoffTime := timestamp.Add(-keepDuration - 10*time.Second)
 	var newPoints []PricePoint
 	for _, point := range ph.Points {
@@ -215,7 +223,6 @@ func (ph *PriceHistory) findPriceExtremes(fromTime, toTime time.Time) (minPrice,
 	defer ph.mu.RUnlock()
 
 	var prices []float64
-
 	for _, point := range ph.Points {
 		if point.Timestamp.After(fromTime) && point.Timestamp.Before(toTime) {
 			prices = append(prices, point.Price)
@@ -228,7 +235,6 @@ func (ph *PriceHistory) findPriceExtremes(fromTime, toTime time.Time) (minPrice,
 
 	minPrice = prices[0]
 	maxPrice = prices[0]
-
 	for _, price := range prices {
 		if price < minPrice {
 			minPrice = price
@@ -248,7 +254,7 @@ func (ph *PriceHistory) getPointsCount() int {
 	return len(ph.Points)
 }
 
-// processTicker обрабатывает один тикер
+// processTicker обрабатывает один тикер БЫСТРО
 func processTicker(
 	ticker api.Ticker,
 	cfg *config.Config,
@@ -257,9 +263,12 @@ func processTicker(
 	client *api.MEXCClient,
 	priceHistories map[string]*PriceHistory,
 	historyMutex *sync.RWMutex,
+	volumeCache *VolumeCache,
 	processedCount *int32,
 	alertCount *int32,
 	intervalDuration time.Duration,
+	volumeWg *sync.WaitGroup,
+	volumeSemaphore chan struct{},
 ) {
 	currentPrice, err := strconv.ParseFloat(ticker.Price, 64)
 	if err != nil || currentPrice <= 0 {
@@ -289,95 +298,129 @@ func processTicker(
 		return
 	}
 
-	// Для 5-секундного интервала используем минимальный буфер
+	// Минимальный буфер для 5-секундного интервала
 	bufferSeconds := 1
 	if cfg.IntervalSeconds > 10 {
-		bufferSeconds = int(math.Max(2, float64(cfg.IntervalSeconds)*0.1))
+		bufferSeconds = 2
 	}
 
 	compareFromTime := currentTime.Add(-intervalDuration - time.Duration(bufferSeconds)*time.Second)
 	compareToTime := currentTime.Add(-intervalDuration + time.Duration(bufferSeconds)*time.Second)
 
-	// Находим минимальную и максимальную цены в этом диапазоне
+	// Находим минимальную и максимальную цены
 	minPrice, maxPrice, found := history.findPriceExtremes(compareFromTime, compareToTime)
 	if !found {
 		return
 	}
 
-	// Рассчитываем изменения для пампа и дампа
+	// Рассчитываем изменения
 	pumpChangePct := ((currentPrice - minPrice) / minPrice) * 100
 	dumpChangePct := ((currentPrice - maxPrice) / maxPrice) * 100
 
-	// Определяем, какое изменение более значительное
 	var significantChangePct float64
+	var changeType string
 	var referencePrice float64
 
 	if math.Abs(pumpChangePct) > math.Abs(dumpChangePct) {
 		significantChangePct = pumpChangePct
+		changeType = "PUMP"
 		referencePrice = minPrice
 	} else {
 		significantChangePct = dumpChangePct
+		changeType = "DUMP"
 		referencePrice = maxPrice
 	}
 
-	// Проверяем, превышает ли изменение пороговое значение
+	// Проверяем порог изменения цены
 	if math.Abs(significantChangePct) >= cfg.PriceChangePct {
-		// Рассчитываем точный объем из trades
-		volumeUSD := calculateVolumeUSD(client, ticker, currentPrice, cfg.IntervalSeconds)
+		// Проверяем кэш объема
+		cachedVolume, hasCache := volumeCache.Get(ticker.Symbol, 2*time.Second)
 
-		// Проверяем объем
-		if volumeUSD >= cfg.VolumeUSD {
-			directionEmoji := "🟢"
-			if significantChangePct < 0 {
-				directionEmoji = "🔴"
-			}
+		if hasCache && cachedVolume >= cfg.VolumeUSD {
+			// Используем кэшированный объем - мгновенный алерт!
+			sendAlert(ticker, significantChangePct, cachedVolume, referencePrice, currentPrice, changeType, bot, bl, alertCount)
+		} else {
+			// Запускаем асинхронную проверку объема
+			volumeWg.Add(1)
+			go func() {
+				defer volumeWg.Done()
 
-			circleEmojis := getCircleEmojis(significantChangePct)
-			eyeEmoji := getEyeEmoji(volumeUSD)
-			fireEmojis := getFireEmojis(volumeUSD)
+				// Пытаемся захватить семафор с таймаутом
+				select {
+				case volumeSemaphore <- struct{}{}:
+					defer func() { <-volumeSemaphore }()
 
-			msg := fmt.Sprintf(
-				"%s %s\n%.2f%% %s\n$%.0f %s%s",
-				strings.ToUpper(ticker.Symbol), directionEmoji,
-				math.Abs(significantChangePct), circleEmojis,
-				volumeUSD, eyeEmoji, fireEmojis,
-			)
+					volume, err := calculateVolumeFromTradesFast(client, ticker.Symbol, cfg.IntervalSeconds)
+					if err == nil {
+						volumeCache.Set(ticker.Symbol, volume)
 
-			log.Printf("🚨 ALERT: %s (%.8f->%.8f)", ticker.Symbol, referencePrice, currentPrice)
-			bot.SendMessage(msg)
-			bl.Add(ticker.Symbol, 10*time.Minute)
-			atomic.AddInt32(alertCount, 1)
+						if volume >= cfg.VolumeUSD {
+							sendAlert(ticker, significantChangePct, volume, referencePrice, currentPrice, changeType, bot, bl, alertCount)
+						}
+					}
+				case <-time.After(100 * time.Millisecond):
+					// Пропускаем если семафор занят
+				}
+			}()
 		}
 	}
 }
 
+// sendAlert отправляет алерт
+func sendAlert(ticker api.Ticker, changePct, volume, refPrice, curPrice float64, changeType string, bot *telegram.Bot, bl *blacklist.Blacklist, alertCount *int32) {
+	directionEmoji := "🟢"
+	if changePct < 0 {
+		directionEmoji = "🔴"
+	}
+
+	circleEmojis := getCircleEmojis(changePct)
+	eyeEmoji := getEyeEmoji(volume)
+	fireEmojis := getFireEmojis(volume)
+
+	msg := fmt.Sprintf(
+		"%s %s\n%.2f%% %s\n$%.0f %s%s",
+		strings.ToUpper(ticker.Symbol), directionEmoji,
+		math.Abs(changePct), circleEmojis,
+		volume, eyeEmoji, fireEmojis,
+	)
+
+	log.Printf("🚨 %s: %s %.8f->%.8f (%.2f%%), Vol: $%.0f",
+		changeType, ticker.Symbol, refPrice, curPrice, changePct, volume)
+
+	bot.SendMessage(msg)
+	bl.Add(ticker.Symbol, 10*time.Minute)
+	atomic.AddInt32(alertCount, 1)
+}
+
 func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bot *telegram.Bot) {
-	// Храним историю цен для каждой монеты
+	// Инициализация
 	priceHistories := make(map[string]*PriceHistory)
 	historyMutex := &sync.RWMutex{}
+	volumeCache := NewVolumeCache()
 
-	// Канал для ограничения параллельных запросов к API
-	// Для 5-секундного интервала увеличиваем до 15 параллельных запросов
-	semaphore := make(chan struct{}, 15)
+	// Увеличиваем количество параллельных запросов для volume
+	volumeSemaphore := make(chan struct{}, 20)
 
-	// Статистика для мониторинга производительности
-	var lastLogTime time.Time
+	// Счетчики
 	var totalCycles int64
+	var lastLogTime time.Time
 
 	log.Printf("🚀 Monitor started (interval: %ds, threshold: %.2f%%, volume: $%.0f)",
 		cfg.IntervalSeconds, cfg.PriceChangePct, cfg.VolumeUSD)
 
+	// Основной цикл
 	for {
-		startTime := time.Now()
+		cycleStart := time.Now()
 		atomic.AddInt64(&totalCycles, 1)
 
-		// Вычисляем динамическую частоту запросов
+		// Частота обновления
 		requestInterval := calculateRequestInterval(cfg.IntervalSeconds)
 
+		// Получаем тикеры
 		tickers, err := client.GetTickers()
 		if err != nil {
 			log.Printf("❌ Error fetching tickers: %v", err)
-			time.Sleep(1 * time.Second)
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
@@ -385,10 +428,13 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 		var alertCount int32
 		intervalDuration := time.Duration(cfg.IntervalSeconds) * time.Second
 
-		// Используем WaitGroup для параллельной обработки
-		var wg sync.WaitGroup
+		// WaitGroup для отслеживания асинхронных проверок объема
+		var volumeWg sync.WaitGroup
 
-		// Обрабатываем тикеры параллельно
+		// Обрабатываем все тикеры ПАРАЛЛЕЛЬНО и БЫСТРО
+		var wg sync.WaitGroup
+		semaphore := make(chan struct{}, 50) // Увеличиваем параллелизм
+
 		for _, ticker := range tickers {
 			if bl.IsBlacklisted(ticker.Symbol) {
 				continue
@@ -398,73 +444,75 @@ func Run(client *api.MEXCClient, cfg *config.Config, bl *blacklist.Blacklist, bo
 			go func(t api.Ticker) {
 				defer wg.Done()
 
-				// Ограничиваем количество параллельных запросов
-				select {
-				case semaphore <- struct{}{}:
-					defer func() { <-semaphore }()
-					processTicker(
-						t, cfg, bl, bot, client,
-						priceHistories, historyMutex,
-						&processedCount, &alertCount,
-						intervalDuration,
-					)
-				case <-time.After(50 * time.Millisecond):
-					// Пропускаем если семафор занят слишком долго
-					return
-				}
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+
+				processTicker(
+					t, cfg, bl, bot, client,
+					priceHistories, historyMutex,
+					volumeCache,
+					&processedCount, &alertCount,
+					intervalDuration,
+					&volumeWg, volumeSemaphore,
+				)
 			}(ticker)
 		}
 
-		// Ждем завершения обработки всех тикеров с таймаутом
-		done := make(chan bool)
+		// Ждем обработку всех тикеров
+		wg.Wait()
+
+		// Ждем завершения проверок объема с таймаутом
+		volumeDone := make(chan bool)
 		go func() {
-			wg.Wait()
-			done <- true
+			volumeWg.Wait()
+			volumeDone <- true
 		}()
 
 		select {
-		case <-done:
-			// Все обработано
-		case <-time.After(requestInterval - 100*time.Millisecond):
-			// Таймаут - переходим к следующему циклу
+		case <-volumeDone:
+			// Все проверки завершены
+		case <-time.After(requestInterval - 50*time.Millisecond):
+			// Таймаут - идем дальше
 		}
 
-		// Очистка старых историй (делаем реже - каждые 20 циклов)
-		if atomic.LoadInt64(&totalCycles)%20 == 0 {
-			historyMutex.Lock()
-			cleanupThreshold := time.Now().Add(-2 * intervalDuration)
-			for symbol, history := range priceHistories {
-				if history.getPointsCount() == 0 {
-					delete(priceHistories, symbol)
-					continue
+		// Очистка старых историй (каждые 30 циклов)
+		if atomic.LoadInt64(&totalCycles)%30 == 0 {
+			go func() {
+				historyMutex.Lock()
+				defer historyMutex.Unlock()
+
+				cleanupThreshold := time.Now().Add(-2 * intervalDuration)
+				for symbol, history := range priceHistories {
+					if history.getPointsCount() == 0 {
+						delete(priceHistories, symbol)
+						continue
+					}
+					history.mu.RLock()
+					needDelete := len(history.Points) > 0 && history.Points[len(history.Points)-1].Timestamp.Before(cleanupThreshold)
+					history.mu.RUnlock()
+					if needDelete {
+						delete(priceHistories, symbol)
+					}
 				}
-				history.mu.RLock()
-				lastPoint := len(history.Points) > 0 && history.Points[len(history.Points)-1].Timestamp.Before(cleanupThreshold)
-				history.mu.RUnlock()
-				if lastPoint {
-					delete(priceHistories, symbol)
-				}
-			}
-			historyMutex.Unlock()
+			}()
 		}
 
-		elapsed := time.Since(startTime)
+		// Статистика
+		elapsed := time.Since(cycleStart)
 		currentAlertCount := atomic.LoadInt32(&alertCount)
 		currentProcessedCount := atomic.LoadInt32(&processedCount)
 
-		// Логируем статистику
 		if currentAlertCount > 0 {
-			log.Printf("🚨 Cycle #%d: %d alerts, %d tickers, %.2fs",
+			log.Printf("🚨 Cycle #%d: %d alerts, %d tickers, %.3fs",
 				totalCycles, currentAlertCount, currentProcessedCount, elapsed.Seconds())
 			lastLogTime = time.Now()
 		} else if time.Since(lastLogTime) > 30*time.Second {
-			// Показываем статус каждые 30 секунд
-			log.Printf("✅ Cycle #%d: %d tickers, %.2fs",
+			log.Printf("✅ Cycle #%d: %d tickers, %.3fs",
 				totalCycles, currentProcessedCount, elapsed.Seconds())
 			lastLogTime = time.Now()
 		}
 
-		// Ждем следующего запроса
+		// Минимальная задержка между циклами
 		if elapsed < requestInterval {
 			time.Sleep(requestInterval - elapsed)
 		}
